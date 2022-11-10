@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <filesystem>
 
 #include "db/builder.h"
 #include "db/db_iter.h"
@@ -147,7 +148,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)),
+      hot_cold_separation_(raw_options.hot_cold_separation),
+      ssd_path_(raw_options.ssd_path),
+      hdd_path_(raw_options.hdd_path) {
+      }
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -289,6 +294,115 @@ void DBImpl::RemoveObsoleteFiles() {
   mutex_.Lock();
 }
 
+void DBImpl::RemoveObsoleteFilesWithSeparation() {
+  mutex_.AssertHeld();
+
+  if (!bg_error_.ok()) {
+    // After a background error, we don't know whether a new version may
+    // or may not have been committed, so we cannot safely garbage collect.
+    return;
+  }
+
+  // Make a set of all of the live files
+  std::set<uint64_t> live = pending_outputs_;
+  versions_->AddLiveFiles(&live);
+
+  std::vector<std::string> ssd_filenames, hdd_filenames;
+  env_->GetChildren(ssd_path_, &ssd_filenames);  
+  env_->GetChildren(hdd_path_, &hdd_filenames); // Ignoring errors on purpose
+  uint64_t number;
+  FileType type;
+  std::vector<std::string> ssd_files_to_delete, hdd_files_to_delete;
+  for (std::string& filename : ssd_filenames) {
+    if (ParseFileName(filename, &number, &type)) {
+      bool keep = true;
+      switch (type) {
+        case kLogFile:
+          keep = ((number >= versions_->LogNumber()) ||
+                  (number == versions_->PrevLogNumber()));
+          break;
+        case kDescriptorFile:
+          // Keep my manifest file, and any newer incarnations'
+          // (in case there is a race that allows other incarnations)
+          keep = (number >= versions_->ManifestFileNumber());
+          break;
+        case kTableFile:
+          keep = (live.find(number) != live.end());
+          break;
+        case kTempFile:
+          // Any temp files that are currently being written to must
+          // be recorded in pending_outputs_, which is inserted into "live"
+          keep = (live.find(number) != live.end());
+          break;
+        case kCurrentFile:
+        case kDBLockFile:
+        case kInfoLogFile:
+          keep = true;
+          break;
+      }
+
+      if (!keep) {
+        ssd_files_to_delete.push_back(std::move(filename));
+        if (type == kTableFile) {
+          table_cache_->Evict(number);
+        }
+        Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
+            static_cast<unsigned long long>(number));
+      }
+    }
+  }
+
+  for (std::string& filename : hdd_filenames) {
+    if (ParseFileName(filename, &number, &type)) {
+      bool keep = true;
+      switch (type) {
+        case kLogFile:
+          keep = ((number >= versions_->LogNumber()) ||
+                  (number == versions_->PrevLogNumber()));
+          break;
+        case kDescriptorFile:
+          // Keep my manifest file, and any newer incarnations'
+          // (in case there is a race that allows other incarnations)
+          keep = (number >= versions_->ManifestFileNumber());
+          break;
+        case kTableFile:
+          keep = (live.find(number) != live.end());
+          break;
+        case kTempFile:
+          // Any temp files that are currently being written to must
+          // be recorded in pending_outputs_, which is inserted into "live"
+          keep = (live.find(number) != live.end());
+          break;
+        case kCurrentFile:
+        case kDBLockFile:
+        case kInfoLogFile:
+          keep = true;
+          break;
+      }
+
+      if (!keep) {
+        hdd_files_to_delete.push_back(std::move(filename));
+        if (type == kTableFile) {
+          table_cache_->Evict(number);
+        }
+        Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
+            static_cast<unsigned long long>(number));
+      }
+    }
+  }
+  // While deleting all files unblock other threads. All files being deleted
+  // have unique names which will not collide with newly created files and
+  // are therefore safe to delete while allowing other threads to proceed.
+  mutex_.Unlock();
+  for (const std::string& filename : ssd_files_to_delete) {
+    env_->RemoveFile(ssd_path_ + "/" + filename);
+  }
+  for (const std::string& filename : hdd_files_to_delete) {
+    env_->RemoveFile(hdd_path_ + "/" + filename);
+  }
+  mutex_.Lock();
+}
+
 Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   mutex_.AssertHeld();
 
@@ -296,6 +410,9 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   // committed only when the descriptor is created, and this directory
   // may already exist from a previous failed creation attempt.
   env_->CreateDir(dbname_);
+  if (hot_cold_separation_) {
+    env_->CreateDir(hdd_path_);
+  }
   assert(db_lock_ == nullptr);
   Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
   if (!s.ok()) {
@@ -546,6 +663,62 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   return s;
 }
 
+Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
+                                              Version* base) {
+  mutex_.AssertHeld();
+  const uint64_t start_micros = env_->NowMicros();
+  FileMetaData meta;
+  meta.number = versions_->NewFileNumber();
+  pending_outputs_.insert(meta.number);
+
+  int level = 0;
+  {
+    Iterator* iter = mem->NewIterator();
+    InternalKey smallest_internal_key, largest_internal_key;
+    iter->SeekToFirst();
+    smallest_internal_key.DecodeFrom(iter->key());
+    iter->SeekToLast();
+    largest_internal_key.DecodeFrom(iter->key());
+    if (base != nullptr) {
+      level = base->PickLevelForMemTableOutput(smallest_internal_key.user_key(), largest_internal_key.user_key());
+    }
+  }
+
+  Iterator* iter = mem->NewIterator();
+  Log(options_.info_log, "Level-0 table #%llu: started",
+      (unsigned long long)meta.number);
+
+  Status s;
+  {
+    mutex_.Unlock();
+    if (level <= 1) {
+      s = BuildTableWithSeparation(ssd_path_, env_, options_, table_cache_, iter, &meta, level);
+    } else {
+      s = BuildTableWithSeparation(hdd_path_, env_, options_, table_cache_, iter, &meta, level);
+    }
+    mutex_.Lock();
+  }
+
+  Log(options_.info_log, "Level-0 table #%llu: %lld bytes %s",
+      (unsigned long long)meta.number, (unsigned long long)meta.file_size,
+      s.ToString().c_str());
+  delete iter;
+  pending_outputs_.erase(meta.number);
+
+  // Note that if file_size is zero, the file has been deleted and
+  // should not be added to the manifest.
+  if (s.ok() && meta.file_size > 0) {
+    edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
+                  meta.largest);
+  }
+
+  CompactionStats stats;
+  stats.micros = env_->NowMicros() - start_micros;
+  stats.bytes_written = meta.file_size;
+  stats_[level].Add(stats);
+  return s;
+}
+
 void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
   assert(imm_ != nullptr);
@@ -554,7 +727,12 @@ void DBImpl::CompactMemTable() {
   VersionEdit edit;
   Version* base = versions_->current();
   base->Ref();
-  Status s = WriteLevel0Table(imm_, &edit, base);
+  Status s;
+  if (hot_cold_separation_) {
+    s = WriteLevel0TableWithSeparation(imm_, &edit, base);
+  } else {
+    s = WriteLevel0Table(imm_, &edit, base);
+  }
   base->Unref();
 
   if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
@@ -573,7 +751,11 @@ void DBImpl::CompactMemTable() {
     imm_->Unref();
     imm_ = nullptr;
     has_imm_.store(false, std::memory_order_release);
-    RemoveObsoleteFiles();
+    if (hot_cold_separation_) {
+      RemoveObsoleteFilesWithSeparation();
+    } else {
+      RemoveObsoleteFiles();
+    }
   } else {
     RecordBackgroundError(s);
   }
@@ -733,9 +915,12 @@ void DBImpl::BackgroundCompaction() {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
+    if (hot_cold_separation_ && c->level() == 1) {
+      std::rename(TableFileName(ssd_path_, f->number).c_str(), TableFileName(hdd_path_, f->number).c_str());
+    } 
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
-                       f->largest);
+                      f->largest);
     status = versions_->LogAndApply(c->edit(), &mutex_);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -753,7 +938,11 @@ void DBImpl::BackgroundCompaction() {
     }
     CleanupCompaction(compact);
     c->ReleaseInputs();
-    RemoveObsoleteFiles();
+    if (hot_cold_separation_) {
+      RemoveObsoleteFilesWithSeparation();
+    } else {
+      RemoveObsoleteFiles();
+    }
   }
   delete c;
 
@@ -1483,6 +1672,11 @@ DB::~DB() = default;
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
 
+  if (options.hot_cold_separation) {
+    if (options.ssd_path.empty() || options.hdd_path.empty() || dbname != options.ssd_path)
+      return Status::InvalidArgument("");
+  }
+
   DBImpl* impl = new DBImpl(options, dbname);
   impl->mutex_.Lock();
   VersionEdit edit;
@@ -1510,7 +1704,11 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
   }
   if (s.ok()) {
-    impl->RemoveObsoleteFiles();
+    if (impl->hot_cold_separation_) {
+      impl->RemoveObsoleteFilesWithSeparation();
+    } else {
+      impl->RemoveObsoleteFiles();
+    }
     impl->MaybeScheduleCompaction();
   }
   impl->mutex_.Unlock();
