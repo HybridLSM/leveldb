@@ -23,6 +23,9 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include "db/keyupd_lru.h"
+#include "db/sst_score_table.h"
+#include "db/hot_table.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
@@ -133,7 +136,14 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       owns_info_log_(options_.info_log != raw_options.info_log),
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
-      table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+      hot_cold_separation_(raw_options.hot_cold_separation),
+      ssd_path_(raw_options.ssd_path),
+      hdd_path_(raw_options.hdd_path),
+      filenum_to_level_(hot_cold_separation_ ? new std::unordered_map<uint64_t, int>() : nullptr),
+      key_upd_lru_(hot_cold_separation_ ? new KeyUpdLru(options_.upd_table_size) : nullptr),
+      score_table_(hot_cold_separation_ ? new ScoreTable() : nullptr),
+      hot_table_(hot_cold_separation_ ? new HotTable(options_.hot_data_threhold, options_.cnter_per_key) : nullptr),
+      table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_), filenum_to_level_)),
       db_lock_(nullptr),
       shutting_down_(false),
       background_work_finished_signal_(&mutex_),
@@ -148,10 +158,10 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)),
-      hot_cold_separation_(raw_options.hot_cold_separation),
-      ssd_path_(raw_options.ssd_path),
-      hdd_path_(raw_options.hdd_path) {
+                               &internal_comparator_)) {
+        if (hot_cold_separation_) {
+          assert(filenum_to_level_ != nullptr);
+        }
       }
 
 DBImpl::~DBImpl() {
@@ -174,7 +184,12 @@ DBImpl::~DBImpl() {
   delete log_;
   delete logfile_;
   delete table_cache_;
-
+  if (hot_cold_separation_) {
+    delete hot_table_;
+    delete score_table_;
+    delete key_upd_lru_;
+    delete filenum_to_level_;
+  }
   if (owns_info_log_) {
     delete options_.info_log;
   }
@@ -691,10 +706,11 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
+    filenum_to_level_->emplace(meta.number, level);
     if (level <= 1) {
-      s = BuildTableWithSeparation(ssd_path_, env_, options_, table_cache_, iter, &meta, level);
+      s = BuildTable(ssd_path_, env_, options_, table_cache_, iter, &meta);
     } else {
-      s = BuildTableWithSeparation(hdd_path_, env_, options_, table_cache_, iter, &meta, level);
+      s = BuildTable(hdd_path_, env_, options_, table_cache_, iter, &meta);
     }
     mutex_.Lock();
   }
@@ -710,6 +726,8 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   if (s.ok() && meta.file_size > 0) {
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
+  } else {
+    filenum_to_level_->erase(meta.number);
   }
 
   CompactionStats stats;

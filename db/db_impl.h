@@ -9,6 +9,7 @@
 #include <deque>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
@@ -25,6 +26,9 @@ class TableCache;
 class Version;
 class VersionEdit;
 class VersionSet;
+class KeyUpdLru;
+class ScoreTable;
+class HotTable;
 
 class DBImpl : public DB {
  public:
@@ -166,6 +170,14 @@ class DBImpl : public DB {
   const bool owns_info_log_;
   const bool owns_cache_;
   std::string dbname_;
+  
+  bool hot_cold_separation_;
+  std::string ssd_path_;
+  std::string hdd_path_;
+  std::unordered_map<uint64_t, int>* const filenum_to_level_;
+  KeyUpdLru* const key_upd_lru_;
+  ScoreTable* const score_table_;
+  HotTable* const hot_table_;
 
   // table_cache_ provides its own synchronization
   TableCache* const table_cache_;
@@ -206,10 +218,6 @@ class DBImpl : public DB {
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
-
-  bool hot_cold_separation_;
-  std::string ssd_path_;
-  std::string hdd_path_;
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

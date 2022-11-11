@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 #include "db/dbformat.h"
 #include "leveldb/cache.h"
@@ -21,7 +22,7 @@ class Env;
 
 class TableCache {
  public:
-  TableCache(const std::string& dbname, const Options& options, int entries);
+  TableCache(const std::string& dbname, const Options& options, int entries, std::unordered_map<uint64_t, int>* filenum_to_level = nullptr);
 
   TableCache(const TableCache&) = delete;
   TableCache& operator=(const TableCache&) = delete;
@@ -37,8 +38,6 @@ class TableCache {
   // returned iterator is live.
   Iterator* NewIterator(const ReadOptions& options, uint64_t file_number,
                         uint64_t file_size, Table** tableptr = nullptr);
-  Iterator* NewIteratorWithSeparation(const ReadOptions& options, uint64_t file_number,
-                        uint64_t file_size, int level, Table** tableptr = nullptr);
 
   // If a seek to internal key "k" in specified file finds an entry,
   // call (*handle_result)(arg, found_key, found_value).
@@ -49,14 +48,18 @@ class TableCache {
   // Evict any entry for the specified file number
   void Evict(uint64_t file_number);
 
+  std::unordered_map<uint64_t, int>* GetFileNumToLevel() {
+    return filenum_to_level_;
+  }
+
  private:
   Status FindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
-  Status FindTableWithSeparation(uint64_t file_number, uint64_t file_size, Cache::Handle**, int level);
 
   Env* const env_;
   const std::string dbname_;
   const Options& options_;
   Cache* cache_;
+  std::unordered_map<uint64_t, int>* const filenum_to_level_;
 };
 
 }  // namespace leveldb
