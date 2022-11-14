@@ -75,6 +75,13 @@ class Version {
   Status Get(const ReadOptions&, const LookupKey& key, std::string* val,
              GetStats* stats);
 
+  // Lookup the value for key in SST file with given file number.
+  // If found, store it in *val and return OK.
+  // Else return a non-OK status.  Fills *stats.
+  // REQUIRES: lock is not held
+  Status GetByFileNum(const ReadOptions&, const LookupKey& key, std::string* val,
+                      GetStats* stats, const uint64_t& file_num, const std::unordered_map<uint64_t, int>* filenum_to_level);
+
   // Adds "stats" into the current state.  Returns true if a new
   // compaction may need to be triggered, false otherwise.
   // REQUIRES: lock is held
@@ -143,6 +150,9 @@ class Version {
   //
   // REQUIRES: user portion of internal_key == user_key.
   void ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
+                          bool (*func)(void*, int, FileMetaData*));
+
+  void ForFileNum(Slice user_key, const uint64_t& file_num, const std::unordered_map<uint64_t, int>* filenum_to_level, void* arg,
                           bool (*func)(void*, int, FileMetaData*));
 
   VersionSet* vset_;  // VersionSet to which this Version belongs
@@ -247,6 +257,10 @@ class VersionSet {
   // Create an iterator that reads over the compaction inputs for "*c".
   // The caller should delete the iterator when no longer needed.
   Iterator* MakeInputIterator(Compaction* c);
+
+  // Create an iterator with file number that reads over the compaction inputs for "*c".
+  // The caller should delete the iterator when no longer needed.
+  Iterator* MakeInputIteratorWithFileNumber(Compaction* c);
 
   // Returns true iff some level needs a compaction.
   bool NeedsCompaction() const {

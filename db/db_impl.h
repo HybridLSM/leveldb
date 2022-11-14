@@ -9,6 +9,7 @@
 #include <deque>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
@@ -25,6 +26,9 @@ class TableCache;
 class Version;
 class VersionEdit;
 class VersionSet;
+class KeyUpdLru;
+class ScoreTable;
+class HotTable;
 
 class DBImpl : public DB {
  public:
@@ -117,6 +121,7 @@ class DBImpl : public DB {
 
   // Delete any unneeded files and stale in-memory entries.
   void RemoveObsoleteFiles() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void RemoveObsoleteFilesWithSeparation() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Compact the in-memory write buffer to disk.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful.
@@ -128,6 +133,8 @@ class DBImpl : public DB {
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit, Version* base)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */)
@@ -144,6 +151,8 @@ class DBImpl : public DB {
   void CleanupCompaction(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status DoCompactionWork(CompactionState* compact)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status DoCompactionWorkWithSpearation(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status OpenCompactionOutputFile(CompactionState* compact);
@@ -162,7 +171,15 @@ class DBImpl : public DB {
   const Options options_;  // options_.comparator == &internal_comparator_
   const bool owns_info_log_;
   const bool owns_cache_;
-  const std::string dbname_;
+  std::string dbname_;
+  
+  bool hot_cold_separation_;
+  std::string ssd_path_;
+  std::string hdd_path_;
+  std::unordered_map<uint64_t, int>* const filenum_to_level_;
+  KeyUpdLru* const key_upd_lru_;
+  ScoreTable* const score_table_;
+  HotTable* const hot_table_;
 
   // table_cache_ provides its own synchronization
   TableCache* const table_cache_;

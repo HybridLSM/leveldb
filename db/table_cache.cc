@@ -30,11 +30,12 @@ static void UnrefEntry(void* arg1, void* arg2) {
 }
 
 TableCache::TableCache(const std::string& dbname, const Options& options,
-                       int entries)
+                       int entries, std::unordered_map<uint64_t, int>* filenum_to_level)
     : env_(options.env),
       dbname_(dbname),
       options_(options),
-      cache_(NewLRUCache(entries)) {}
+      cache_(NewLRUCache(entries)),
+      filenum_to_level_(filenum_to_level) {}
 
 TableCache::~TableCache() { delete cache_; }
 
@@ -46,12 +47,23 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
   Slice key(buf, sizeof(buf));
   *handle = cache_->Lookup(key);
   if (*handle == nullptr) {
-    std::string fname = TableFileName(dbname_, file_number);
+
+    std::string fname;
+    if (!options_.hot_cold_separation) {
+      fname = TableFileName(dbname_, file_number);
+    } else {
+      fname = TableFileName((*filenum_to_level_)[file_number] <= 1 ? options_.ssd_path : options_.hdd_path, file_number);
+    }
     RandomAccessFile* file = nullptr;
     Table* table = nullptr;
     s = env_->NewRandomAccessFile(fname, &file);
     if (!s.ok()) {
-      std::string old_fname = SSTTableFileName(dbname_, file_number);
+      std::string old_fname;
+      if (!options_.hot_cold_separation) {
+        old_fname = SSTTableFileName(dbname_, file_number);
+      } else {
+        old_fname = SSTTableFileName((*filenum_to_level_)[file_number] <= 1 ? options_.ssd_path : options_.hdd_path, file_number);
+      }
       if (env_->NewRandomAccessFile(old_fname, &file).ok()) {
         s = Status::OK();
       }

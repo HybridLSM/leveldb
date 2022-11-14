@@ -16,8 +16,8 @@ endif(NOT CMAKE_C_STANDARD)
 
 # C++ standard can be overridden when this is used as a sub-project.
 if(NOT CMAKE_CXX_STANDARD)
-  # This project requires C++11.
-  set(CMAKE_CXX_STANDARD 11)
+  # This project requires C++17.
+  set(CMAKE_CXX_STANDARD 17)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
 endif(NOT CMAKE_CXX_STANDARD)
@@ -132,6 +132,8 @@ target_sources(leveldb
     "db/dumpfile.cc"
     "db/filename.cc"
     "db/filename.h"
+    "db/hot_table.h"
+    "db/keyupd_lru.h"
     "db/log_format.h"
     "db/log_reader.cc"
     "db/log_reader.h"
@@ -142,6 +144,7 @@ target_sources(leveldb
     "db/repair.cc"
     "db/skiplist.h"
     "db/snapshot.h"
+    "db/sst_score_table.h"
     "db/table_cache.cc"
     "db/table_cache.h"
     "db/version_edit.cc"
@@ -161,6 +164,7 @@ target_sources(leveldb
     "table/filter_block.h"
     "table/format.cc"
     "table/format.h"
+    "table/iterator_with_file_number.h"
     "table/iterator_wrapper.h"
     "table/iterator.cc"
     "table/merger.cc"
@@ -435,6 +439,10 @@ if(LEVELDB_BUILD_BENCHMARKS)
 
   if(NOT BUILD_SHARED_LIBS)
     leveldb_benchmark("benchmarks/db_bench.cc")
+  endif(NOT BUILD_SHARED_LIBS)
+
+  if(NOT BUILD_SHARED_LIBS)
+    leveldb_benchmark("benchmarks/db_bench_with_separation.cc")
   endif(NOT BUILD_SHARED_LIBS)
 
   check_library_exists(sqlite3 sqlite3_open "" HAVE_SQLITE3)

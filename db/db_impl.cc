@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <filesystem>
 
 #include "db/builder.h"
 #include "db/db_iter.h"
@@ -22,6 +23,9 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include "db/keyupd_lru.h"
+#include "db/sst_score_table.h"
+#include "db/hot_table.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
@@ -132,7 +136,14 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       owns_info_log_(options_.info_log != raw_options.info_log),
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
-      table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+      hot_cold_separation_(raw_options.hot_cold_separation),
+      ssd_path_(raw_options.ssd_path),
+      hdd_path_(raw_options.hdd_path),
+      filenum_to_level_(hot_cold_separation_ ? new std::unordered_map<uint64_t, int>() : nullptr),
+      key_upd_lru_(hot_cold_separation_ ? new KeyUpdLru(options_.upd_table_size) : nullptr),
+      score_table_(hot_cold_separation_ ? new ScoreTable() : nullptr),
+      hot_table_(hot_cold_separation_ ? new HotTable(options_.hot_threhold, options_.warm_threhold, options_.cnter_per_key) : nullptr),
+      table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_), filenum_to_level_)),
       db_lock_(nullptr),
       shutting_down_(false),
       background_work_finished_signal_(&mutex_),
@@ -147,7 +158,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)) {
+        if (hot_cold_separation_) {
+          assert(filenum_to_level_ != nullptr);
+        }
+      }
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -169,7 +184,12 @@ DBImpl::~DBImpl() {
   delete log_;
   delete logfile_;
   delete table_cache_;
-
+  if (hot_cold_separation_) {
+    delete hot_table_;
+    delete score_table_;
+    delete key_upd_lru_;
+    delete filenum_to_level_;
+  }
   if (owns_info_log_) {
     delete options_.info_log;
   }
@@ -289,6 +309,115 @@ void DBImpl::RemoveObsoleteFiles() {
   mutex_.Lock();
 }
 
+void DBImpl::RemoveObsoleteFilesWithSeparation() {
+  mutex_.AssertHeld();
+
+  if (!bg_error_.ok()) {
+    // After a background error, we don't know whether a new version may
+    // or may not have been committed, so we cannot safely garbage collect.
+    return;
+  }
+
+  // Make a set of all of the live files
+  std::set<uint64_t> live = pending_outputs_;
+  versions_->AddLiveFiles(&live);
+
+  std::vector<std::string> ssd_filenames, hdd_filenames;
+  env_->GetChildren(ssd_path_, &ssd_filenames);  
+  env_->GetChildren(hdd_path_, &hdd_filenames); // Ignoring errors on purpose
+  uint64_t number;
+  FileType type;
+  std::vector<std::string> ssd_files_to_delete, hdd_files_to_delete;
+  for (std::string& filename : ssd_filenames) {
+    if (ParseFileName(filename, &number, &type)) {
+      bool keep = true;
+      switch (type) {
+        case kLogFile:
+          keep = ((number >= versions_->LogNumber()) ||
+                  (number == versions_->PrevLogNumber()));
+          break;
+        case kDescriptorFile:
+          // Keep my manifest file, and any newer incarnations'
+          // (in case there is a race that allows other incarnations)
+          keep = (number >= versions_->ManifestFileNumber());
+          break;
+        case kTableFile:
+          keep = (live.find(number) != live.end());
+          break;
+        case kTempFile:
+          // Any temp files that are currently being written to must
+          // be recorded in pending_outputs_, which is inserted into "live"
+          keep = (live.find(number) != live.end());
+          break;
+        case kCurrentFile:
+        case kDBLockFile:
+        case kInfoLogFile:
+          keep = true;
+          break;
+      }
+
+      if (!keep) {
+        ssd_files_to_delete.push_back(std::move(filename));
+        if (type == kTableFile) {
+          table_cache_->Evict(number);
+        }
+        Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
+            static_cast<unsigned long long>(number));
+      }
+    }
+  }
+
+  for (std::string& filename : hdd_filenames) {
+    if (ParseFileName(filename, &number, &type)) {
+      bool keep = true;
+      switch (type) {
+        case kLogFile:
+          keep = ((number >= versions_->LogNumber()) ||
+                  (number == versions_->PrevLogNumber()));
+          break;
+        case kDescriptorFile:
+          // Keep my manifest file, and any newer incarnations'
+          // (in case there is a race that allows other incarnations)
+          keep = (number >= versions_->ManifestFileNumber());
+          break;
+        case kTableFile:
+          keep = (live.find(number) != live.end());
+          break;
+        case kTempFile:
+          // Any temp files that are currently being written to must
+          // be recorded in pending_outputs_, which is inserted into "live"
+          keep = (live.find(number) != live.end());
+          break;
+        case kCurrentFile:
+        case kDBLockFile:
+        case kInfoLogFile:
+          keep = true;
+          break;
+      }
+
+      if (!keep) {
+        hdd_files_to_delete.push_back(std::move(filename));
+        if (type == kTableFile) {
+          table_cache_->Evict(number);
+        }
+        Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
+            static_cast<unsigned long long>(number));
+      }
+    }
+  }
+  // While deleting all files unblock other threads. All files being deleted
+  // have unique names which will not collide with newly created files and
+  // are therefore safe to delete while allowing other threads to proceed.
+  mutex_.Unlock();
+  for (const std::string& filename : ssd_files_to_delete) {
+    env_->RemoveFile(ssd_path_ + "/" + filename);
+  }
+  for (const std::string& filename : hdd_files_to_delete) {
+    env_->RemoveFile(hdd_path_ + "/" + filename);
+  }
+  mutex_.Lock();
+}
+
 Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   mutex_.AssertHeld();
 
@@ -296,6 +425,9 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   // committed only when the descriptor is created, and this directory
   // may already exist from a previous failed creation attempt.
   env_->CreateDir(dbname_);
+  if (hot_cold_separation_) {
+    env_->CreateDir(hdd_path_);
+  }
   assert(db_lock_ == nullptr);
   Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
   if (!s.ok()) {
@@ -546,6 +678,65 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   return s;
 }
 
+Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
+                                              Version* base) {
+  mutex_.AssertHeld();
+  const uint64_t start_micros = env_->NowMicros();
+  FileMetaData meta;
+  meta.number = versions_->NewFileNumber();
+  pending_outputs_.insert(meta.number);
+
+  int level = 0;
+  {
+    Iterator* iter = mem->NewIterator();
+    InternalKey smallest_internal_key, largest_internal_key;
+    iter->SeekToFirst();
+    smallest_internal_key.DecodeFrom(iter->key());
+    iter->SeekToLast();
+    largest_internal_key.DecodeFrom(iter->key());
+    if (base != nullptr) {
+      level = base->PickLevelForMemTableOutput(smallest_internal_key.user_key(), largest_internal_key.user_key());
+    }
+  }
+
+  Iterator* iter = mem->NewIterator();
+  Log(options_.info_log, "Level-0 table #%llu: started",
+      (unsigned long long)meta.number);
+
+  Status s;
+  {
+    mutex_.Unlock();
+    filenum_to_level_->emplace(meta.number, level);
+    if (level <= 1) {
+      s = BuildTable(ssd_path_, env_, options_, table_cache_, iter, &meta, key_upd_lru_, score_table_);
+    } else {
+      s = BuildTable(hdd_path_, env_, options_, table_cache_, iter, &meta, key_upd_lru_, score_table_);
+    }
+    mutex_.Lock();
+  }
+
+  Log(options_.info_log, "Level-0 table #%llu: %lld bytes %s",
+      (unsigned long long)meta.number, (unsigned long long)meta.file_size,
+      s.ToString().c_str());
+  delete iter;
+  pending_outputs_.erase(meta.number);
+
+  // Note that if file_size is zero, the file has been deleted and
+  // should not be added to the manifest.
+  if (s.ok() && meta.file_size > 0) {
+    edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
+                  meta.largest);
+  } else {
+    filenum_to_level_->erase(meta.number);
+  }
+
+  CompactionStats stats;
+  stats.micros = env_->NowMicros() - start_micros;
+  stats.bytes_written = meta.file_size;
+  stats_[level].Add(stats);
+  return s;
+}
+
 void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
   assert(imm_ != nullptr);
@@ -554,7 +745,12 @@ void DBImpl::CompactMemTable() {
   VersionEdit edit;
   Version* base = versions_->current();
   base->Ref();
-  Status s = WriteLevel0Table(imm_, &edit, base);
+  Status s;
+  if (hot_cold_separation_) {
+    s = WriteLevel0TableWithSeparation(imm_, &edit, base);
+  } else {
+    s = WriteLevel0Table(imm_, &edit, base);
+  }
   base->Unref();
 
   if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
@@ -573,7 +769,11 @@ void DBImpl::CompactMemTable() {
     imm_->Unref();
     imm_ = nullptr;
     has_imm_.store(false, std::memory_order_release);
-    RemoveObsoleteFiles();
+    if (hot_cold_separation_) {
+      RemoveObsoleteFilesWithSeparation();
+    } else {
+      RemoveObsoleteFiles();
+    }
   } else {
     RecordBackgroundError(s);
   }
@@ -733,9 +933,13 @@ void DBImpl::BackgroundCompaction() {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
+    if (hot_cold_separation_ && c->level() == 1) {
+      std::rename(TableFileName(ssd_path_, f->number).c_str(), TableFileName(hdd_path_, f->number).c_str());
+      (*filenum_to_level_)[f->number] = c->level() + 1;
+    } 
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
-                       f->largest);
+                      f->largest);
     status = versions_->LogAndApply(c->edit(), &mutex_);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -747,13 +951,17 @@ void DBImpl::BackgroundCompaction() {
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
   } else {
     CompactionState* compact = new CompactionState(c);
-    status = DoCompactionWork(compact);
+    status = hot_cold_separation_ ? DoCompactionWorkWithSpearation(compact) : DoCompactionWork(compact);
     if (!status.ok()) {
       RecordBackgroundError(status);
     }
     CleanupCompaction(compact);
     c->ReleaseInputs();
-    RemoveObsoleteFiles();
+    if (hot_cold_separation_) {
+      RemoveObsoleteFilesWithSeparation();
+    } else {
+      RemoveObsoleteFiles();
+    }
   }
   delete c;
 
@@ -814,7 +1022,12 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   }
 
   // Make the output file
-  std::string fname = TableFileName(dbname_, file_number);
+  std::string fname;
+  if (hot_cold_separation_) {
+    fname = TableFileName(compact->compaction->level() + 1 <= 1 ? ssd_path_ : hdd_path_, file_number);
+  } else {
+    fname = TableFileName(dbname_, file_number);
+  }
   Status s = env_->NewWritableFile(fname, &compact->outfile);
   if (s.ok()) {
     compact->builder = new TableBuilder(options_, compact->outfile);
@@ -857,6 +1070,9 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
+    if (hot_cold_separation_) {
+      filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
+    }
     Iterator* iter =
         table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
     s = iter->status();
@@ -1050,6 +1266,185 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   return status;
 }
 
+Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
+  assert(hot_cold_separation_);
+  assert(hot_table_ != nullptr);
+  assert(key_upd_lru_ != nullptr);
+  assert(score_table_ != nullptr);
+
+  const uint64_t start_micros = env_->NowMicros();
+  int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
+
+  Log(options_.info_log, "Compacting %d@%d + %d@%d files",
+      compact->compaction->num_input_files(0), compact->compaction->level(),
+      compact->compaction->num_input_files(1),
+      compact->compaction->level() + 1);
+
+  assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
+  assert(compact->builder == nullptr);
+  assert(compact->outfile == nullptr);
+  if (snapshots_.empty()) {
+    compact->smallest_snapshot = versions_->LastSequence();
+  } else {
+    compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
+  }
+
+  Iterator* input = versions_->MakeInputIteratorWithFileNumber(compact->compaction);
+
+  // Release mutex while we're actually doing the compaction work
+  mutex_.Unlock();
+
+  input->SeekToFirst();
+  Status status;
+  ParsedInternalKey ikey;
+  std::string current_user_key;
+  bool has_current_user_key = false;
+  SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+  while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
+    // Prioritize immutable compaction work
+    if (has_imm_.load(std::memory_order_relaxed)) {
+      const uint64_t imm_start = env_->NowMicros();
+      mutex_.Lock();
+      if (imm_ != nullptr) {
+        CompactMemTable();
+        // Wake up MakeRoomForWrite() if necessary.
+        background_work_finished_signal_.SignalAll();
+      }
+      mutex_.Unlock();
+      imm_micros += (env_->NowMicros() - imm_start);
+    }
+
+    Slice key_and_filenum = input->key();
+    Slice key = Slice(key_and_filenum.data(), key_and_filenum.size() - 8);
+    uint64_t cur_file_num = DecodeFixed64(key_and_filenum.data() + key.size());
+    if (compact->compaction->ShouldStopBefore(key) &&
+        compact->builder != nullptr) {
+      status = FinishCompactionOutputFile(compact, input);
+      if (!status.ok()) {
+        break;
+      }
+    }
+
+    // Handle key/value, add to state, etc.
+    bool drop = false;
+    if (!ParseInternalKey(key, &ikey)) {
+      // Do not hide error keys
+      current_user_key.clear();
+      has_current_user_key = false;
+      last_sequence_for_key = kMaxSequenceNumber;
+    } else {
+      if (!has_current_user_key ||
+          user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
+              0) {
+        // First occurrence of this user key
+        current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
+        has_current_user_key = true;
+        last_sequence_for_key = kMaxSequenceNumber;
+      }
+
+      if (last_sequence_for_key <= compact->smallest_snapshot) {
+        // Hidden by an newer entry for same user key
+        drop = true;  // (A)
+      } else if (ikey.type == kTypeDeletion &&
+                 ikey.sequence <= compact->smallest_snapshot &&
+                 compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
+        // For this user key:
+        // (1) there is no data in higher levels
+        // (2) data in lower levels will have larger sequence numbers
+        // (3) data in layers that are being compacted here and have
+        //     smaller sequence numbers will be dropped in the next
+        //     few iterations of this loop (by rule (A) above).
+        // Therefore this deletion marker is obsolete and can be dropped.
+        drop = true;
+      } else {
+        uint64_t newest_file_num;
+        if (key_upd_lru_->FindSst(ikey.user_key, &newest_file_num)) {
+          // Find key in Key Update Table
+          if(newest_file_num != cur_file_num) {
+            drop = true;
+          }
+        }
+      }
+
+      last_sequence_for_key = ikey.sequence;
+    }
+#if 0
+    Log(options_.info_log,
+        "  Compact: %s, seq %d, type: %d %d, drop: %d, is_base: %d, "
+        "%d smallest_snapshot: %d",
+        ikey.user_key.ToString().c_str(),
+        (int)ikey.sequence, ikey.type, kTypeValue, drop,
+        compact->compaction->IsBaseLevelForKey(ikey.user_key),
+        (int)last_sequence_for_key, (int)compact->smallest_snapshot);
+#endif
+
+    if (!drop) {
+      // Open output file if necessary
+      if (compact->builder == nullptr) {
+        status = OpenCompactionOutputFile(compact);
+        if (!status.ok()) {
+          break;
+        }
+      }
+      if (compact->builder->NumEntries() == 0) {
+        compact->current_output()->smallest.DecodeFrom(key);
+      }
+      compact->current_output()->largest.DecodeFrom(key);
+      compact->builder->Add(key, input->value());
+
+      // Close output file if it is big enough
+      if (compact->builder->FileSize() >=
+          compact->compaction->MaxOutputFileSize()) {
+        status = FinishCompactionOutputFile(compact, input);
+        if (!status.ok()) {
+          break;
+        }
+      }
+
+      // Update Key Update Table
+      key_upd_lru_->CompareAndUpdateSst(ikey.user_key, cur_file_num, compact->current_output()->number);
+    }
+
+    input->Next();
+  }
+
+  if (status.ok() && shutting_down_.load(std::memory_order_acquire)) {
+    status = Status::IOError("Deleting DB during compaction");
+  }
+  if (status.ok() && compact->builder != nullptr) {
+    status = FinishCompactionOutputFile(compact, input);
+  }
+  if (status.ok()) {
+    status = input->status();
+  }
+  delete input;
+  input = nullptr;
+
+  CompactionStats stats;
+  stats.micros = env_->NowMicros() - start_micros - imm_micros;
+  for (int which = 0; which < 2; which++) {
+    for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
+      stats.bytes_read += compact->compaction->input(which, i)->file_size;
+    }
+  }
+  for (size_t i = 0; i < compact->outputs.size(); i++) {
+    stats.bytes_written += compact->outputs[i].file_size;
+  }
+
+  mutex_.Lock();
+  stats_[compact->compaction->level() + 1].Add(stats);
+
+  if (status.ok()) {
+    status = InstallCompactionResults(compact);
+  }
+  if (!status.ok()) {
+    RecordBackgroundError(status);
+  }
+  VersionSet::LevelSummaryStorage tmp;
+  Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
+  return status;
+}
+
 namespace {
 
 struct IterState {
@@ -1139,15 +1534,23 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(key, snapshot);
+    uint64_t target_file_num;
     if (mem->Get(lkey, value, &s)) {
       // Done
     } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
       // Done
+    } else if (hot_cold_separation_ && key_upd_lru_->FindSst(key, &target_file_num)) {
+        s = current->GetByFileNum(options, lkey, value, &stats, target_file_num, filenum_to_level_);
+        have_stat_update = true;
     } else {
       s = current->Get(options, lkey, value, &stats);
       have_stat_update = true;
     }
     mutex_.Lock();
+  }
+
+  if (s.ok() && hot_cold_separation_) {
+    hot_table_->AddKey(key);
   }
 
   if (have_stat_update && current->UpdateStats(stats)) {
@@ -1483,6 +1886,11 @@ DB::~DB() = default;
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
 
+  if (options.hot_cold_separation) {
+    if (options.ssd_path.empty() || options.hdd_path.empty() || dbname != options.ssd_path)
+      return Status::InvalidArgument("");
+  }
+
   DBImpl* impl = new DBImpl(options, dbname);
   impl->mutex_.Lock();
   VersionEdit edit;
@@ -1510,7 +1918,11 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
   }
   if (s.ok()) {
-    impl->RemoveObsoleteFiles();
+    if (impl->hot_cold_separation_) {
+      impl->RemoveObsoleteFilesWithSeparation();
+    } else {
+      impl->RemoveObsoleteFiles();
+    }
     impl->MaybeScheduleCompaction();
   }
   impl->mutex_.Unlock();
