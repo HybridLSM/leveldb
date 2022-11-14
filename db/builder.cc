@@ -8,6 +8,8 @@
 #include "db/filename.h"
 #include "db/table_cache.h"
 #include "db/version_edit.h"
+#include "db/keyupd_lru.h"
+#include "db/sst_score_table.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/iterator.h"
@@ -15,7 +17,12 @@
 namespace leveldb {
 
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta) {
+                  TableCache* table_cache, Iterator* iter, FileMetaData* meta, KeyUpdLru* key_upd, ScoreTable* score_table) {
+  if (options.hot_cold_separation) {
+    assert(key_upd != nullptr);
+    assert(score_table != nullptr);
+  }
+
   Status s;
   meta->file_size = 0;
   iter->SeekToFirst();
@@ -31,9 +38,14 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     TableBuilder* builder = new TableBuilder(options, file);
     meta->smallest.DecodeFrom(iter->key());
     Slice key;
+    Slice user_key;
     for (; iter->Valid(); iter->Next()) {
       key = iter->key();
       builder->Add(key, iter->value());
+      if(options.hot_cold_separation) {
+        user_key = ExtractUserKey(key);
+        key_upd->Add(user_key, meta->number, score_table);
+      }
     }
     if (!key.empty()) {
       meta->largest.DecodeFrom(key);

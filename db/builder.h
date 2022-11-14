@@ -16,6 +16,9 @@ class Env;
 class Iterator;
 class TableCache;
 class VersionEdit;
+class KeyUpdLru;
+class ScoreTable;
+class HotTable;
 
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to meta->number.  On success, the rest of
@@ -23,7 +26,7 @@ class VersionEdit;
 // If no data is present in *iter, meta->file_size will be set to
 // zero, and no Table file will be produced.
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta);
+                  TableCache* table_cache, Iterator* iter, FileMetaData* meta, KeyUpdLru* key_upd = nullptr, ScoreTable* score_table = nullptr);
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_BUILDER_H_

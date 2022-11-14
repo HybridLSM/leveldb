@@ -126,8 +126,11 @@ class CountingBloomFilter {
 */
 class HotTable {
 public:
-  explicit HotTable(uint32_t thred, uint32_t cnter_per_key) : 
-                    cnter_per_key_(cnter_per_key), thred_(thred), cbf_(new CountingBloomFilter(cnter_per_key_)) {
+  explicit HotTable(uint32_t hot_thred, uint32_t warm_thred, uint32_t cnter_per_key) : 
+                    cnter_per_key_(cnter_per_key), 
+                    hot_thred_(hot_thred),
+                    warm_thred_(warm_thred),
+                    cbf_(new CountingBloomFilter(cnter_per_key_)) {
     cbf_->InitCBF();
   }
   HotTable(const HotTable &) = delete;
@@ -144,7 +147,11 @@ public:
   }
 
   bool IsHotKey(const Slice& key) {
-    return cbf_->KeyCounter(key) >= thred_;
+    return cbf_->KeyCounter(key) >= hot_thred_;
+  }
+
+  bool IsWramKey(const Slice& key) {
+    return cbf_->KeyCounter(key) >= warm_thred_;
   }
 
   void clear() {
@@ -155,7 +162,8 @@ public:
 
 private:
   uint32_t cnter_per_key_;
-  uint32_t thred_;
+  uint32_t hot_thred_;
+  uint32_t warm_thred_;
   CountingBloomFilter* cbf_;
 };
 

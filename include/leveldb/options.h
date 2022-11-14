@@ -149,7 +149,8 @@ struct LEVELDB_EXPORT Options {
   std::string ssd_path;
   std::string hdd_path;
 
-  uint32_t hot_data_threhold = 8;
+  uint32_t hot_threhold = 12;
+  uint32_t warm_threhold = 8;
   uint32_t cnter_per_key = 3;
   uint32_t upd_table_size = 4096;
 };
