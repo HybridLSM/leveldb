@@ -18,6 +18,7 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <unordered_map>
 
 #include "db/dbformat.h"
 #include "db/version_edit.h"
@@ -62,6 +63,7 @@ class Version {
   struct GetStats {
     FileMetaData* seek_file;
     int seek_file_level;
+    // uint64_t cur_filenum;
   };
 
   // Append to *iters a sequence of iterators that will
@@ -312,6 +314,7 @@ class VersionSet {
   const Options* const options_;
   TableCache* const table_cache_;
   const InternalKeyComparator icmp_;
+  const InternalKeyComparatorWithFileNum icmp_with_filenum_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
   uint64_t last_sequence_;

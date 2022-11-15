@@ -42,8 +42,8 @@ public:
 			//old id score +1
 			score_tbl->AddScore(*id_ptr);
 			sstid_cache_->Release(handle);
+			sstid_cache_->Erase(key);
 		}
-
 		sstid_cache_->Release(sstid_cache_->Insert(key, EncodeValue(v_ptr), 1, DeleteValue));
 	}
 

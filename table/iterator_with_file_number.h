@@ -34,7 +34,7 @@ class IteratorWithFileNumber : public Iterator {
   private:
     const uint64_t file_number_;
     Iterator* data_iter_;
-    mutable char key_buf[128];
+    mutable char key_buf[256];
 }; 
 
 Iterator* NewIteratorWithFileNumber(const uint64_t file_number, Iterator* data_iter) {

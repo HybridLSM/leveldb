@@ -390,6 +390,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         state->stats->seek_file_level = state->last_file_read_level;
       }
 
+      // state->stats->cur_filenum = f->number;
       state->last_file_read = f;
       state->last_file_read_level = level;
 
@@ -859,6 +860,7 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       options_(options),
       table_cache_(table_cache),
       icmp_(*cmp),
+      icmp_with_filenum_(&icmp_),
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()
       last_sequence_(0),
@@ -1400,7 +1402,7 @@ Iterator* VersionSet::MakeInputIteratorWithFileNumber(Compaction* c) {
     }
   }
   assert(num <= space);
-  Iterator* result = NewMergingIterator(&icmp_, list, num);
+  Iterator* result = NewMergingIterator(&icmp_with_filenum_, list, num);
   delete[] list;
   return result;
 }

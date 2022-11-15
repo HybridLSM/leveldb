@@ -96,6 +96,24 @@ void InternalKeyComparator::FindShortSuccessor(std::string* key) const {
   }
 }
 
+const char* InternalKeyComparatorWithFileNum::Name() const {
+  return "leveldb.InternalKeyComparatorWithFileNum";
+}
+
+int InternalKeyComparatorWithFileNum::Compare(const Slice& akey, const Slice& bkey) const {
+  return internalkey_comparator_->Compare(ExtractInternalKey(akey), ExtractInternalKey(bkey));
+}
+
+void InternalKeyComparatorWithFileNum::FindShortestSeparator(std::string* start,
+                                                  const Slice& limit) const {
+  // Attempt to shorten the user portion of the key
+  internalkey_comparator_->FindShortestSeparator(start, limit);
+}
+
+void InternalKeyComparatorWithFileNum::FindShortSuccessor(std::string* key) const {
+  internalkey_comparator_->FindShortSuccessor(key);
+}
+
 const char* InternalFilterPolicy::Name() const { return user_policy_->Name(); }
 
 void InternalFilterPolicy::CreateFilter(const Slice* keys, int n,
