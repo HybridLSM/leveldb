@@ -97,6 +97,11 @@ inline Slice ExtractUserKey(const Slice& internal_key) {
   return Slice(internal_key.data(), internal_key.size() - 8);
 }
 
+inline Slice ExtractInternalKey(const Slice& internal_key_with_filenum) {
+  assert(internal_key_with_filenum.size() >= 8);
+  return Slice(internal_key_with_filenum.data(), internal_key_with_filenum.size() - 8);
+}
+
 // A comparator for internal keys that uses a specified comparator for
 // the user key portion and breaks ties by decreasing sequence number.
 class InternalKeyComparator : public Comparator {
@@ -114,6 +119,22 @@ class InternalKeyComparator : public Comparator {
   const Comparator* user_comparator() const { return user_comparator_; }
 
   int Compare(const InternalKey& a, const InternalKey& b) const;
+};
+
+// A comparator for internal keys with file 
+class InternalKeyComparatorWithFileNum : public Comparator {
+ private:
+  const InternalKeyComparator* internalkey_comparator_;
+
+ public:
+  explicit InternalKeyComparatorWithFileNum(const InternalKeyComparator* c) : internalkey_comparator_(c) {}
+  const char* Name() const override;
+  int Compare(const Slice& a, const Slice& b) const override;
+  void FindShortestSeparator(std::string* start,
+                             const Slice& limit) const override;
+  void FindShortSuccessor(std::string* key) const override;
+
+  const Comparator* user_comparator() const { return internalkey_comparator_; }
 };
 
 // Filter policy wrapper that converts from internal keys to user keys

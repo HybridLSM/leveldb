@@ -63,7 +63,7 @@ static const char* FLAGS_benchmarks =
     "snappyuncomp,";
 
 // Number of key/values to place in database
-static int FLAGS_num = 100000000;
+static int FLAGS_num = 1000000;
 
 // Number of read operations to do.  If negative, do FLAGS_num reads.
 static int FLAGS_reads = -1;
@@ -777,8 +777,8 @@ class Benchmark {
     options.compression =
         FLAGS_compression ? kSnappyCompression : kNoCompression;
     options.hot_cold_separation = true;
-    options.ssd_path = "/mnt/nvme0n1/ssd";
-    options.hdd_path = "/tmp/leveldbtest-1004/dbbench_separation/hdd";
+    options.ssd_path = "/data/leveldb-test/ssd";
+    options.hdd_path = "/data/leveldb-test/hdd";
     Status s = DB::Open(options, FLAGS_db, &db_);
     if (!s.ok()) {
       std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
@@ -1091,7 +1091,7 @@ int main(int argc, char** argv) {
   // Choose a location for the test database if none given with --db=<path>
   if (FLAGS_db == nullptr) {
     leveldb::g_env->GetTestDirectory(&default_db_path);
-    default_db_path = "/mnt/nvme0n1/ssd";
+    default_db_path = "/data/leveldb-test/ssd";
     FLAGS_db = default_db_path.c_str();
   }
 

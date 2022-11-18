@@ -1539,12 +1539,27 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
       // Done
     } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
       // Done
-    } else if (hot_cold_separation_ && key_upd_lru_->FindSst(key, &target_file_num)) {
-        s = current->GetByFileNum(options, lkey, value, &stats, target_file_num, filenum_to_level_);
-        have_stat_update = true;
     } else {
-      s = current->Get(options, lkey, value, &stats);
-      have_stat_update = true;
+      // bool tag1 = false, tag2 = false;
+      if (hot_cold_separation_ && key_upd_lru_->FindSst(key, &target_file_num)) {
+        // tag1 = true;
+        s = current->GetByFileNum(options, lkey, value, &stats, target_file_num, filenum_to_level_);
+        if (s.ok()) {
+          // tag2 = true;
+          have_stat_update = true;
+        }
+      }
+      if (!have_stat_update) {
+        s = current->Get(options, lkey, value, &stats);
+        have_stat_update = true;
+      }
+      // if (tag1 && !tag2) {
+      //   std::cout << s.ok() << "\t" << target_file_num 
+      //             << "\t" << (*filenum_to_level_)[target_file_num] 
+      //             << "\t" << stats.cur_filenum 
+      //             << "\t" << (*filenum_to_level_)[stats.cur_filenum]
+      //             << std::endl;
+      // }
     }
     mutex_.Lock();
   }
