@@ -509,7 +509,7 @@ void Version::ForHWLevel(Slice user_key, Slice internal_key,
                           FileArea area, 
                           void* arg,
                           bool (*func)(void*, int, FileMetaData*)) {
-  assert(area == FileArea::fHot && area == FileArea::fWarm);
+  assert(area == FileArea::fHot || area == FileArea::fWarm);
   
   const Comparator* ucmp = vset_->icmp_.user_comparator();
   std::vector<FileMetaData*> &files = (area == FileArea::fHot) ? hot_files_ : warm_files_; 

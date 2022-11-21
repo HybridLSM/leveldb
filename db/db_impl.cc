@@ -1633,16 +1633,19 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
         switch (area) {
           case FileArea::fHot:
             status = OpenCompactionHWOutputFile(compact, area);
+            output = compact->current_hot_output();
             builder = compact->hot_builder;
             break;
           
           case FileArea::fWarm:
             status = OpenCompactionHWOutputFile(compact, area);
+            output = compact->current_warm_output();
             builder = compact->warm_builder;
             break;
           
           case FileArea::fNormal:
             status = OpenCompactionOutputFile(compact);
+            output = compact->current_output();
             builder = compact->builder;
             break;
         }
@@ -1659,7 +1662,7 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
       // Close output file if it is big enough
       if (builder->FileSize() >=
           compact->compaction->MaxOutputFileSize()) {
-        if (area == FileArea::fHot || FileArea::fWarm) {
+        if (area == FileArea::fHot || area == FileArea::fWarm) {
           status = FinishCompactionHWOutputFile(compact, input, area);
         } else {
           status = FinishCompactionOutputFile(compact, input);
@@ -1670,7 +1673,7 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
       }
 
       // Update Key Update Table
-      key_upd_lru_->CompareAndUpdateSst(ikey.user_key, cur_file_num, compact->current_output()->number);
+      key_upd_lru_->CompareAndUpdateSst(ikey.user_key, cur_file_num, output->number);
     }
 
     input->Next();
@@ -1718,6 +1721,11 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
 
   if (status.ok()) {
     status = InstallCompactionResultsWithSeparation(compact);
+    for (int which = 0; which < 2; which++) {
+      for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
+        score_table_->RemoveSstScore(compact->compaction->input(which, i)->number);
+      }
+    }
   }
   if (!status.ok()) {
     RecordBackgroundError(status);
