@@ -64,12 +64,18 @@ struct DBImpl::CompactionState {
   };
 
   Output* current_output() { return &outputs[outputs.size() - 1]; }
+  Output* current_hot_output() { return &hot_outputs[hot_outputs.size() - 1]; }
+  Output* current_warm_output() { return &warm_outputs[warm_outputs.size() - 1]; }
 
   explicit CompactionState(Compaction* c)
       : compaction(c),
         smallest_snapshot(0),
         outfile(nullptr),
+        hot_outfile(nullptr),
+        warm_outfile(nullptr),
         builder(nullptr),
+        hot_builder(nullptr),
+        warm_builder(nullptr),
         total_bytes(0) {}
 
   Compaction* const compaction;
@@ -81,10 +87,16 @@ struct DBImpl::CompactionState {
   SequenceNumber smallest_snapshot;
 
   std::vector<Output> outputs;
+  std::vector<Output> hot_outputs;
+  std::vector<Output> warm_outputs;
 
   // State kept for output being generated
   WritableFile* outfile;
+  WritableFile* hot_outfile;
+  WritableFile* warm_outfile;
   TableBuilder* builder;
+  TableBuilder* hot_builder;
+  TableBuilder* warm_builder;
 
   uint64_t total_bytes;
 };
@@ -695,7 +707,7 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
     iter->SeekToLast();
     largest_internal_key.DecodeFrom(iter->key());
     if (base != nullptr) {
-      level = base->PickLevelForMemTableOutput(smallest_internal_key.user_key(), largest_internal_key.user_key());
+      level = base->PickLevelForMemTableOutputWithSeparation(smallest_internal_key.user_key(), largest_internal_key.user_key(), &meta.area);
     }
   }
 
@@ -706,8 +718,8 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
-    filenum_to_level_->emplace(meta.number, level);
-    if (level <= 1) {
+    filenum_to_level_->emplace(meta.number, meta.area == FileArea::fNormal ? level : config::kNumLevels + (int)meta.area);
+    if (level == 0 || meta.area == FileArea::fHot || meta.area == FileArea::fWarm) {
       s = BuildTable(ssd_path_, env_, options_, table_cache_, iter, &meta, key_upd_lru_, score_table_);
     } else {
       s = BuildTable(hdd_path_, env_, options_, table_cache_, iter, &meta, key_upd_lru_, score_table_);
@@ -725,7 +737,7 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   // should not be added to the manifest.
   if (s.ok() && meta.file_size > 0) {
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
-                  meta.largest);
+                  meta.largest, meta.area);
   } else {
     filenum_to_level_->erase(meta.number);
   }
@@ -771,6 +783,9 @@ void DBImpl::CompactMemTable() {
     has_imm_.store(false, std::memory_order_release);
     if (hot_cold_separation_) {
       RemoveObsoleteFilesWithSeparation();
+      if (versions_->current()->CheckScoreCompact(score_table_, filenum_to_level_, options_.score_compaction_threhold)) {
+        MaybeScheduleCompaction();
+      }
     } else {
       RemoveObsoleteFiles();
     }
@@ -923,7 +938,11 @@ void DBImpl::BackgroundCompaction() {
         (m->end ? m->end->DebugString().c_str() : "(end)"),
         (m->done ? "(end)" : manual_end.DebugString().c_str()));
   } else {
-    c = versions_->PickCompaction();
+    if (!hot_cold_separation_) {
+      c = versions_->PickCompaction();
+    } else {
+      c = versions_->PickCompactionWithSeparation();
+    }
   }
 
   Status status;
@@ -933,14 +952,16 @@ void DBImpl::BackgroundCompaction() {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
-    if (hot_cold_separation_ && c->level() == 1) {
-      std::rename(TableFileName(ssd_path_, f->number).c_str(), TableFileName(hdd_path_, f->number).c_str());
-      (*filenum_to_level_)[f->number] = c->level() + 1;
+    if (hot_cold_separation_ && c->level() == 0) {
+      env_->RenameFile(TableFileName(ssd_path_, f->number), TableFileName(hdd_path_, f->number));
     } 
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
                       f->largest);
     status = versions_->LogAndApply(c->edit(), &mutex_);
+    if (status.ok()) {
+        (*filenum_to_level_)[f->number] = c->level() + 1;
+    }
     if (!status.ok()) {
       RecordBackgroundError(status);
     }
@@ -955,7 +976,7 @@ void DBImpl::BackgroundCompaction() {
     if (!status.ok()) {
       RecordBackgroundError(status);
     }
-    CleanupCompaction(compact);
+    CleanupCompactionWithSeparation(compact);
     c->ReleaseInputs();
     if (hot_cold_separation_) {
       RemoveObsoleteFilesWithSeparation();
@@ -1005,6 +1026,50 @@ void DBImpl::CleanupCompaction(CompactionState* compact) {
   delete compact;
 }
 
+void DBImpl::CleanupCompactionWithSeparation(CompactionState* compact) {
+  mutex_.AssertHeld();
+  if (compact->builder != nullptr) {
+    // May happen if we get a shutdown call in the middle of compaction
+    compact->builder->Abandon();
+    delete compact->builder;
+  } else {
+    assert(compact->outfile == nullptr);
+  }
+  delete compact->outfile;
+  for (size_t i = 0; i < compact->outputs.size(); i++) {
+    const CompactionState::Output& out = compact->outputs[i];
+    pending_outputs_.erase(out.number);
+  }
+
+  if (compact->hot_builder != nullptr) {
+    // May happen if we get a shutdown call in the middle of compaction
+    compact->hot_builder->Abandon();
+    delete compact->hot_builder;
+  } else {
+    assert(compact->hot_outfile == nullptr);
+  }
+  delete compact->hot_outfile;
+  for (size_t i = 0; i < compact->hot_outputs.size(); i++) {
+    const CompactionState::Output& out = compact->hot_outputs[i];
+    pending_outputs_.erase(out.number);
+  }
+
+  if (compact->warm_builder != nullptr) {
+    // May happen if we get a shutdown call in the middle of compaction
+    compact->warm_builder->Abandon();
+    delete compact->warm_builder;
+  } else {
+    assert(compact->warm_outfile == nullptr);
+  }
+  delete compact->warm_outfile;
+  for (size_t i = 0; i < compact->warm_outputs.size(); i++) {
+    const CompactionState::Output& out = compact->warm_outputs[i];
+    pending_outputs_.erase(out.number);
+  }
+
+  delete compact;
+}
+
 Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   assert(compact != nullptr);
   assert(compact->builder == nullptr);
@@ -1024,13 +1089,46 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   // Make the output file
   std::string fname;
   if (hot_cold_separation_) {
-    fname = TableFileName(compact->compaction->level() + 1 <= 1 ? ssd_path_ : hdd_path_, file_number);
+    fname = TableFileName(hdd_path_, file_number);
   } else {
     fname = TableFileName(dbname_, file_number);
   }
   Status s = env_->NewWritableFile(fname, &compact->outfile);
   if (s.ok()) {
     compact->builder = new TableBuilder(options_, compact->outfile);
+  }
+  return s;
+}
+
+Status DBImpl::OpenCompactionHWOutputFile(CompactionState* compact, FileArea area) {
+  assert(area == FileArea::fHot || FileArea::fWarm);
+  assert(compact != nullptr);
+  assert(hot_cold_separation_);
+  
+  TableBuilder* &builder = (area == FileArea::fHot) ? compact->hot_builder : compact->warm_builder;
+  WritableFile* &outfile = (area == FileArea::fHot) ? compact->hot_outfile : compact->warm_outfile;
+  std::vector<CompactionState::Output> &outputs = (area == FileArea::fHot) ? compact->hot_outputs : compact->warm_outputs;
+  assert(builder== nullptr);
+
+
+  uint64_t file_number;
+  {
+    mutex_.Lock();
+    file_number = versions_->NewFileNumber();
+    pending_outputs_.insert(file_number);
+    CompactionState::Output out;
+    out.number = file_number;
+    out.smallest.Clear();
+    out.largest.Clear();
+    outputs.push_back(out);
+    mutex_.Unlock();
+  }
+
+  // Make the output file
+  std::string fname = TableFileName(ssd_path_, file_number);
+  Status s = env_->NewWritableFile(fname, &outfile);
+  if (s.ok()) {
+    builder = new TableBuilder(options_, outfile);
   }
   return s;
 }
@@ -1087,6 +1185,65 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   return s;
 }
 
+Status DBImpl::FinishCompactionHWOutputFile(CompactionState* compact,
+                                            Iterator* input, FileArea area) {
+  assert(area == FileArea::fHot || area == FileArea::fWarm);
+  TableBuilder* &builder = (area == FileArea::fHot) ? compact->hot_builder : compact->warm_builder;
+  WritableFile* &outfile = (area == FileArea::fHot) ? compact->hot_outfile : compact->warm_outfile;
+  std::vector<CompactionState::Output> &outputs = (area == FileArea::fHot) ? compact->hot_outputs : compact->warm_outputs;
+  CompactionState::Output* current_output = (area == FileArea::fHot) ? 
+                                            compact->current_hot_output() : compact->current_warm_output();
+
+  assert(compact != nullptr);
+  assert(outfile != nullptr);
+  assert(builder != nullptr);
+
+  const uint64_t output_number = current_output->number;
+  assert(output_number != 0);
+
+  // Check for iterator errors
+  Status s = input->status();
+  const uint64_t current_entries = builder->NumEntries();
+  if (s.ok()) {
+    builder->Finish();
+  } else {
+    builder->Abandon();
+  }
+  const uint64_t current_bytes = builder->FileSize();
+  current_output->file_size = current_bytes;
+  compact->total_bytes += current_bytes;
+  delete builder;
+  builder = nullptr;
+
+  // Finish and check for file errors
+  if (s.ok()) {
+    s = outfile->Sync();
+  }
+  if (s.ok()) {
+    s = outfile->Close();
+  }
+  delete outfile;
+  outfile = nullptr;
+
+  if (s.ok() && current_entries > 0) {
+    // Verify that the table is usable
+    if (hot_cold_separation_) {
+      filenum_to_level_->emplace(output_number, config::kNumLevels + area);
+    }
+    Iterator* iter =
+        table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
+    s = iter->status();
+    delete iter;
+    if (s.ok()) {
+      Log(options_.info_log, "Generated table #%llu@%d: %lld keys, %lld bytes",
+          (unsigned long long)output_number, compact->compaction->level(),
+          (unsigned long long)current_entries,
+          (unsigned long long)current_bytes);
+    }
+  }
+  return s;
+}
+
 Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   mutex_.AssertHeld();
   Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
@@ -1101,6 +1258,35 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
     const CompactionState::Output& out = compact->outputs[i];
     compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
                                          out.smallest, out.largest);
+  }
+  return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+}
+
+Status DBImpl::InstallCompactionResultsWithSeparation(CompactionState* compact) {
+  mutex_.AssertHeld();
+  Log(options_.info_log, "Compacted %d@%d + %d@%d + %d files => %lld bytes",
+      compact->compaction->num_input_files(0), compact->compaction->level(),
+      compact->compaction->num_input_files(1), compact->compaction->level() + 1,
+      compact->compaction->num_hw_input_files(),
+      static_cast<long long>(compact->total_bytes));
+
+  // Add compaction outputs
+  compact->compaction->AddInputDeletionsWithSeparation(compact->compaction->edit());
+  const int level = compact->compaction->level();
+  for (size_t i = 0; i < compact->outputs.size(); i++) {
+    const CompactionState::Output& out = compact->outputs[i];
+    compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
+                                         out.smallest, out.largest);
+  }
+  for (size_t i = 0; i < compact->hot_outputs.size(); i++) {
+    const CompactionState::Output& out = compact->hot_outputs[i];
+    compact->compaction->edit()->AddFile(config::kNumLevels + FileArea::fHot, out.number, out.file_size,
+                                         out.smallest, out.largest, FileArea::fHot);
+  }
+  for (size_t i = 0; i < compact->warm_outputs.size(); i++) {
+    const CompactionState::Output& out = compact->warm_outputs[i];
+    compact->compaction->edit()->AddFile(config::kNumLevels + FileArea::fWarm, out.number, out.file_size,
+                                         out.smallest, out.largest, FileArea::fWarm);
   }
   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
 }
@@ -1275,10 +1461,11 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
   const uint64_t start_micros = env_->NowMicros();
   int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
 
-  Log(options_.info_log, "Compacting %d@%d + %d@%d files",
+  Log(options_.info_log, "Compacting %d@%d + %d@%d + %dfiles",
       compact->compaction->num_input_files(0), compact->compaction->level(),
       compact->compaction->num_input_files(1),
-      compact->compaction->level() + 1);
+      compact->compaction->level() + 1,
+      compact->compaction->num_hw_input_files());
 
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
@@ -1317,16 +1504,23 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
     Slice key_and_filenum = input->key();
     Slice key = Slice(key_and_filenum.data(), key_and_filenum.size() - 8);
     uint64_t cur_file_num = DecodeFixed64(key_and_filenum.data() + key.size());
-    if (compact->compaction->ShouldStopBefore(key) &&
-        compact->builder != nullptr) {
-      status = FinishCompactionOutputFile(compact, input);
-      if (!status.ok()) {
-        break;
+
+    bool is_hot = hot_table_->IsHotKey(key);
+    bool is_warm = hot_table_->IsWramKey(key);
+
+    if (!is_hot && !is_warm) {
+      if (compact->compaction->ShouldStopBefore(key) &&
+          compact->builder != nullptr) {
+        status = FinishCompactionOutputFile(compact, input);
+        if (!status.ok()) {
+          break;
+        }
       }
     }
 
     // Handle key/value, add to state, etc.
     bool drop = false;
+    uint64_t newest_file_num;
     if (!ParseInternalKey(key, &ikey)) {
       // Do not hide error keys
       current_user_key.clear();
@@ -1356,12 +1550,37 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
         //     few iterations of this loop (by rule (A) above).
         // Therefore this deletion marker is obsolete and can be dropped.
         drop = true;
+      } else if (key_upd_lru_->FindSst(ikey.user_key, &newest_file_num) &&
+                 newest_file_num != cur_file_num){
+        // For the user key which in key_upd_lru and corresponding filenum
+        // is difference from the input filenum, it means the key is outdate
+        // and can be throw 
+        drop = true;
       } else {
-        uint64_t newest_file_num;
-        if (key_upd_lru_->FindSst(ikey.user_key, &newest_file_num)) {
-          // Find key in Key Update Table
-          if(newest_file_num != cur_file_num) {
-            drop = true;
+        // For the user key will rise, check for conflicts
+        Version* cur_version = versions_->current();
+        LookupKey lkey(current_user_key, versions_->LastSequence());
+        Version::GetStats tmp_stat;
+
+        if (compact->compaction->level() == 0) {
+          // nothing to do
+        } else if (compact->compaction->level() == 1) {
+          if (is_hot && 
+              cur_version->CheckKeyExistInHWLevel(ReadOptions(), lkey, &tmp_stat, FileArea::fHot)) {
+             drop = true;
+          }
+        } else {
+          if (is_hot) {
+            if (cur_version->CheckKeyExistInHWLevel(ReadOptions(), lkey, &tmp_stat, FileArea::fHot) || 
+                cur_version->CheckKeyExistInLevels(ReadOptions(), lkey, &tmp_stat, 1, compact->compaction->level() - 1) || 
+                cur_version->CheckKeyExistInHWLevel(ReadOptions(), lkey, &tmp_stat, FileArea::fWarm)) {
+              drop = true;
+            }
+          } else if (is_warm) {
+            if (cur_version->CheckKeyExistInHWLevel(ReadOptions(), lkey, &tmp_stat, FileArea::fWarm) || 
+                cur_version->CheckKeyExistInLevels(ReadOptions(), lkey, &tmp_stat, 2, compact->compaction->level() - 1)) {
+              drop = true;
+            }
           }
         }
       }
@@ -1379,23 +1598,72 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
 #endif
 
     if (!drop) {
+      // Select target builder
+      TableBuilder* builder = nullptr;
+      CompactionState::Output* output;
+      FileArea area = FileArea::fUnKnown;
+      if (compact->compaction->level() == 0) {
+        if (is_hot) {
+          builder = compact->hot_builder;
+          output = compact->current_hot_output();
+          area = FileArea::fHot;
+        } else {
+          builder = compact->builder;
+          output = compact->current_output();
+          area = FileArea::fNormal;
+        }
+      } else {
+        if (is_hot) {
+          builder = compact->hot_builder;
+          output = compact->current_hot_output();
+          area = FileArea::fHot;
+        } else if (is_warm) {
+          builder = compact->warm_builder;
+          output = compact->current_warm_output();
+          area = FileArea::fWarm;
+        } else {
+          builder = compact->builder;
+          output = compact->current_output();
+          area = FileArea::fNormal;
+        }
+      }
+
       // Open output file if necessary
-      if (compact->builder == nullptr) {
-        status = OpenCompactionOutputFile(compact);
+      if (builder == nullptr) {
+        switch (area) {
+          case FileArea::fHot:
+            status = OpenCompactionHWOutputFile(compact, area);
+            builder = compact->hot_builder;
+            break;
+          
+          case FileArea::fWarm:
+            status = OpenCompactionHWOutputFile(compact, area);
+            builder = compact->warm_builder;
+            break;
+          
+          case FileArea::fNormal:
+            status = OpenCompactionOutputFile(compact);
+            builder = compact->builder;
+            break;
+        }
         if (!status.ok()) {
           break;
         }
       }
-      if (compact->builder->NumEntries() == 0) {
-        compact->current_output()->smallest.DecodeFrom(key);
+      if (builder->NumEntries() == 0) {
+        output->smallest.DecodeFrom(key);
       }
-      compact->current_output()->largest.DecodeFrom(key);
-      compact->builder->Add(key, input->value());
+      output->largest.DecodeFrom(key);
+      builder->Add(key, input->value());
 
       // Close output file if it is big enough
-      if (compact->builder->FileSize() >=
+      if (builder->FileSize() >=
           compact->compaction->MaxOutputFileSize()) {
-        status = FinishCompactionOutputFile(compact, input);
+        if (area == FileArea::fHot || FileArea::fWarm) {
+          status = FinishCompactionHWOutputFile(compact, input, area);
+        } else {
+          status = FinishCompactionOutputFile(compact, input);
+        }
         if (!status.ok()) {
           break;
         }
@@ -1414,6 +1682,12 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
   if (status.ok() && compact->builder != nullptr) {
     status = FinishCompactionOutputFile(compact, input);
   }
+  if (status.ok() && compact->hot_builder != nullptr) {
+    status = FinishCompactionHWOutputFile(compact, input, FileArea::fHot);
+  }
+  if (status.ok() && compact->warm_builder != nullptr) {
+    status = FinishCompactionHWOutputFile(compact, input, FileArea::fWarm);
+  }
   if (status.ok()) {
     status = input->status();
   }
@@ -1427,15 +1701,23 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
       stats.bytes_read += compact->compaction->input(which, i)->file_size;
     }
   }
+  for (int i = 0; i < compact->compaction->num_hw_input_files(); i++) {
+    stats.bytes_read += compact->compaction->hw_input(i)->file_size;
+  }
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     stats.bytes_written += compact->outputs[i].file_size;
   }
-
+  for (size_t i = 0; i < compact->hot_outputs.size(); i++) {
+    stats.bytes_written += compact->hot_outputs[i].file_size;
+  }
+  for (size_t i = 0; i < compact->warm_outputs.size(); i++) {
+    stats.bytes_written += compact->warm_outputs[i].file_size;
+  }
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
-    status = InstallCompactionResults(compact);
+    status = InstallCompactionResultsWithSeparation(compact);
   }
   if (!status.ok()) {
     RecordBackgroundError(status);
@@ -1568,9 +1850,9 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     hot_table_->AddKey(key);
   }
 
-  if (have_stat_update && current->UpdateStats(stats)) {
-    MaybeScheduleCompaction();
-  }
+  // if (have_stat_update && current->UpdateStats(stats)) {
+  //   MaybeScheduleCompaction();
+  // }
   mem->Unref();
   if (imm != nullptr) imm->Unref();
   current->Unref();

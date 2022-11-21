@@ -52,7 +52,8 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
     if (!options_.hot_cold_separation) {
       fname = TableFileName(dbname_, file_number);
     } else {
-      fname = TableFileName((*filenum_to_level_)[file_number] <= 1 ? options_.ssd_path : options_.hdd_path, file_number);
+      int level = (*filenum_to_level_)[file_number];
+      fname = TableFileName(level == 0 || level > config::kNumLevels ? options_.ssd_path : options_.hdd_path, file_number);
     }
     RandomAccessFile* file = nullptr;
     Table* table = nullptr;
@@ -62,7 +63,8 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
       if (!options_.hot_cold_separation) {
         old_fname = SSTTableFileName(dbname_, file_number);
       } else {
-        old_fname = SSTTableFileName((*filenum_to_level_)[file_number] <= 1 ? options_.ssd_path : options_.hdd_path, file_number);
+        int level = (*filenum_to_level_)[file_number];
+        old_fname = SSTTableFileName(level == 0 || level > config::kNumLevels ? options_.ssd_path : options_.hdd_path, file_number);
       }
       if (env_->NewRandomAccessFile(old_fname, &file).ok()) {
         s = Status::OK();

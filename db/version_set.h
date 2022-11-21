@@ -39,6 +39,7 @@ class TableCache;
 class Version;
 class VersionSet;
 class WritableFile;
+class ScoreTable;
 
 // Return the smallest index i such that files[i]->largest >= key.
 // Return files.size() if there is no such file.
@@ -84,10 +85,28 @@ class Version {
   Status GetByFileNum(const ReadOptions&, const LookupKey& key, std::string* val,
                       GetStats* stats, const uint64_t& file_num, const std::unordered_map<uint64_t, int>* filenum_to_level);
 
+  // Lookup the value for key when hot_cold_separation_ is true. If found, store it in *val and
+  // return OK.  Else return a non-OK status.  Fills *stats.
+  // REQUIRES: lock is not held
+  Status GetWithSeparation(const ReadOptions&, const LookupKey& key, std::string* val,
+                           GetStats* stats);
+
+  // Check if givem key exists between min level and max level (Normal Level)
+  // REQUIRES: lock is not held
+  bool CheckKeyExistInLevels(const ReadOptions&, const LookupKey& key,
+                             GetStats* stats, int min_level, int max_level);
+  
+  // Check if givem key exists in level-hot or level-warm
+  // REQUIRES: lock is not held
+  bool CheckKeyExistInHWLevel(const ReadOptions&, const LookupKey& key,
+                              GetStats* stats, FileArea area);
+
   // Adds "stats" into the current state.  Returns true if a new
   // compaction may need to be triggered, false otherwise.
   // REQUIRES: lock is held
   bool UpdateStats(const GetStats& stats);
+
+  bool CheckScoreCompact(ScoreTable* score_table, std::unordered_map<uint64_t, int>* filenum_to_level, uint32_t thred);
 
   // Record a sample of bytes read at the specified internal key.
   // Samples are taken approximately once every config::kReadBytesPeriod
@@ -106,6 +125,10 @@ class Version {
       const InternalKey* end,    // nullptr means after all keys
       std::vector<FileMetaData*>* inputs);
 
+  void GetOverlappingHWInputs(FileArea area, const InternalKey* begin,
+                              const InternalKey* end,
+                              std::vector<FileMetaData*>* inputs);
+
   // Returns true iff some file in the specified level overlaps
   // some part of [*smallest_user_key,*largest_user_key].
   // smallest_user_key==nullptr represents a key smaller than all the DB's keys.
@@ -117,6 +140,8 @@ class Version {
   // result that covers the range [smallest_user_key,largest_user_key].
   int PickLevelForMemTableOutput(const Slice& smallest_user_key,
                                  const Slice& largest_user_key);
+  int PickLevelForMemTableOutputWithSeparation(const Slice& smallest_user_key,
+                                               const Slice& largest_user_key, FileArea* file_type);
 
   int NumFiles(int level) const { return files_[level].size(); }
 
@@ -153,9 +178,18 @@ class Version {
   // REQUIRES: user portion of internal_key == user_key.
   void ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
                           bool (*func)(void*, int, FileMetaData*));
+  
+  void ForEachOverlappingWithSeparation(Slice user_key, Slice internal_key, void* arg,
+                          bool (*func)(void*, int, FileMetaData*));
 
   void ForFileNum(Slice user_key, const uint64_t& file_num, const std::unordered_map<uint64_t, int>* filenum_to_level, void* arg,
                           bool (*func)(void*, int, FileMetaData*));
+
+  void ForLevels(Slice user_key, Slice internal_key, int min_level, int max_level, void* arg,
+                 bool (*func)(void*, int, FileMetaData*));
+  
+  void ForHWLevel(Slice user_key, Slice internal_key, FileArea area, void* arg,
+                  bool (*func)(void*, int, FileMetaData*));
 
   VersionSet* vset_;  // VersionSet to which this Version belongs
   Version* next_;     // Next version in linked list
@@ -164,6 +198,8 @@ class Version {
 
   // List of files per level
   std::vector<FileMetaData*> files_[config::kNumLevels];
+  std::vector<FileMetaData*> hot_files_;
+  std::vector<FileMetaData*> warm_files_;
 
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;
@@ -245,6 +281,8 @@ class VersionSet {
   // describes the compaction.  Caller should delete the result.
   Compaction* PickCompaction();
 
+  Compaction* PickCompactionWithSeparation();
+
   // Return a compaction object for compacting the range [begin,end] in
   // the specified level.  Returns nullptr if there is nothing in that
   // level that overlaps the specified range.  Caller should delete
@@ -302,7 +340,14 @@ class VersionSet {
                  const std::vector<FileMetaData*>& inputs2,
                  InternalKey* smallest, InternalKey* largest);
 
+  void GetRange3(const std::vector<FileMetaData*>& inputs1,
+                 const std::vector<FileMetaData*>& inputs2,
+                 const std::vector<FileMetaData*>& inputs3,
+                 InternalKey* smallest, InternalKey* largest);
+
   void SetupOtherInputs(Compaction* c);
+
+  void SetupOtherInputsWithSeparation(Compaction* c);
 
   // Save current contents to *log
   Status WriteSnapshot(log::Writer* log);
@@ -348,8 +393,12 @@ class Compaction {
   // "which" must be either 0 or 1
   int num_input_files(int which) const { return inputs_[which].size(); }
 
+  int num_hw_input_files() const { return hw_input_.size(); }
+
   // Return the ith input file at "level()+which" ("which" must be 0 or 1).
   FileMetaData* input(int which, int i) const { return inputs_[which][i]; }
+
+  FileMetaData* hw_input(int i) const { return hw_input_[i]; }
 
   // Maximum size of files to build during this compaction.
   uint64_t MaxOutputFileSize() const { return max_output_file_size_; }
@@ -360,6 +409,8 @@ class Compaction {
 
   // Add all inputs to this compaction as delete operations to *edit.
   void AddInputDeletions(VersionEdit* edit);
+
+  void AddInputDeletionsWithSeparation(VersionEdit* edit);
 
   // Returns true if the information we have available guarantees that
   // the compaction is producing data in "level+1" for which no data exists
@@ -387,6 +438,7 @@ class Compaction {
 
   // Each compaction reads inputs from "level_" and "level_+1"
   std::vector<FileMetaData*> inputs_[2];  // The two sets of inputs
+  std::vector<FileMetaData*> hw_input_;
 
   // State used to check for number of overlapping grandparent files
   // (parent == level_ + 1, grandparent == level_ + 2)
