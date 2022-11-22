@@ -444,11 +444,30 @@ void Version::ForFileNum(Slice user_key, const uint64_t& file_num,
   int target_level = it->second;
 
   FileMetaData* target = nullptr;
-  for (uint32_t i = 0; i < files_[target_level].size(); i++) {
-    FileMetaData* f = files_[target_level][i];
-    if (f->number == file_num){
-      target = f;
-      break;
+  if (target_level == config::kNumLevels + FileArea::fHot) {
+    for (uint32_t i = 0; i < hot_files_.size(); i++) {
+      FileMetaData* f = hot_files_[i];
+      if (f->number == file_num){
+        target = f;
+        break;
+      }
+    }
+  } else if (target_level == config::kNumLevels + FileArea::fWarm) {
+    for (uint32_t i = 0; i < warm_files_.size(); i++) {
+      FileMetaData* f = warm_files_[i];
+      if (f->number == file_num){
+        target = f;
+        break;
+      }
+    }    
+  } else {
+    assert(target_level < config::kNumLevels);
+    for (uint32_t i = 0; i < files_[target_level].size(); i++) {
+      FileMetaData* f = files_[target_level][i];
+      if (f->number == file_num){
+        target = f;
+        break;
+      }
     }
   }
 
@@ -1914,6 +1933,12 @@ void VersionSet::AddLiveFiles(std::set<uint64_t>* live) {
       for (size_t i = 0; i < files.size(); i++) {
         live->insert(files[i]->number);
       }
+    }
+    for (size_t i = 0; i < v->hot_files_.size(); i++) {
+      live->insert(v->hot_files_[i]->number);
+    }
+    for (size_t i = 0; i < v->warm_files_.size(); i++) {
+      live->insert(v->warm_files_[i]->number);
     }
   }
 }

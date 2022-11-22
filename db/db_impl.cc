@@ -1840,7 +1840,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
         }
       }
       if (!have_stat_update) {
-        s = current->Get(options, lkey, value, &stats);
+        s = hot_cold_separation_ ? current->GetWithSeparation(options, lkey, value, &stats) : current->Get(options, lkey, value, &stats);
         have_stat_update = true;
       }
       // if (tag1 && !tag2) {
