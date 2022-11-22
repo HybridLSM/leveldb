@@ -1811,7 +1811,12 @@ void VersionSet::Finalize(Version* v) {
               static_cast<double>(config::kL0_CompactionTrigger);
     } else {
       // Compute the ratio of current size to size limit.
-      const uint64_t level_bytes = TotalFileSize(v->files_[level]);
+      uint64_t level_bytes = TotalFileSize(v->files_[level]);
+      if (options_->hot_cold_separation && level == 1) {
+        level_bytes += TotalFileSize(v->hot_files_);
+      } else if (options_->hot_cold_separation && level == 2) {
+        level_bytes += TotalFileSize(v->warm_files_);
+      }
       score =
           static_cast<double>(level_bytes) / MaxBytesForLevel(options_, level);
     }

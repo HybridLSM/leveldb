@@ -738,6 +738,7 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   if (s.ok() && meta.file_size > 0) {
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest, meta.area);
+    score_table_->AddItem(meta.number);
   } else {
     filenum_to_level_->erase(meta.number);
   }
@@ -1168,14 +1169,15 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
-    if (hot_cold_separation_) {
-      filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
-    }
     Iterator* iter =
         table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
     s = iter->status();
     delete iter;
     if (s.ok()) {
+      if (hot_cold_separation_) {
+        filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
+        score_table_->AddItem(output_number);
+      }
       Log(options_.info_log, "Generated table #%llu@%d: %lld keys, %lld bytes",
           (unsigned long long)output_number, compact->compaction->level(),
           (unsigned long long)current_entries,

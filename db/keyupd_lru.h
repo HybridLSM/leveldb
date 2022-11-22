@@ -23,6 +23,7 @@ static void DeleteValue(const Slice& key, void* value) {
 class KeyUpdLru {
 private:
 	Cache* sstid_cache_;
+	std::vector<std::tuple<>> upd_entries; 
 public:
 	KeyUpdLru(const int kCacheSize) : sstid_cache_(NewLRUCache(kCacheSize)) {
 
