@@ -240,6 +240,13 @@ inline LookupKey::~LookupKey() {
   if (start_ != space_) delete[] start_;
 }
 
+enum FileArea {
+  fUnKnown = -0x1, 
+  fNormal = 0x0, 
+  fHot = 0x1, 
+  fWarm = 0x2
+};
+
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_DBFORMAT_H_

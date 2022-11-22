@@ -153,6 +153,7 @@ struct LEVELDB_EXPORT Options {
   uint32_t warm_threhold = 8;
   uint32_t cnter_per_key = 3;
   uint32_t upd_table_size = 4096;
+  uint32_t score_compaction_threhold = 1 << 13;
 };
 
 // Options that control read operations

@@ -150,14 +150,20 @@ class DBImpl : public DB {
   void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void CleanupCompaction(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void CleanupCompactionWithSeparation(CompactionState* compact)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status DoCompactionWork(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status DoCompactionWorkWithSpearation(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status OpenCompactionOutputFile(CompactionState* compact);
+  Status OpenCompactionHWOutputFile(CompactionState* compact, FileArea area);
   Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input);
+  Status FinishCompactionHWOutputFile(CompactionState* compact, Iterator* input, FileArea area);
   Status InstallCompactionResults(CompactionState* compact)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status InstallCompactionResultsWithSeparation(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   const Comparator* user_comparator() const {
