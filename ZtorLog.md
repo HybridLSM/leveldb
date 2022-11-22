@@ -8,13 +8,14 @@
 - 添加上述三个表的数据记录逻辑
 - L1、L2层的冷热划分
 - Compaction输入文件的选取
+- Compaction过程的旧数据清楚和冷热数据分离
+- Get过程的查询修改
 
 ### DOING
-- Compaction过程的旧数据清楚和冷热数据分离
+- 检查可能的线程安全问题
 
 ### TODO
 - Compaction过程使用HDD
-- Get过程的查询修改
 
 ## 存在的问题和修改方案
 - **在Get的过程中，可能会由于同时发生的Compaction（主要是Major Compaction）导致`key_upd`表被更新，而`version`没来得及更新，导致得到错误的文件号，使得查询失败。**
@@ -31,3 +32,5 @@
 - **在Major Compaction过程中，可能会存在因`hot_table`改变而导致前后相同key被判定是否为热数据的结果不一，存在隐患。**
   
   解决方案参考上一条，对`hot_table`做同样的修改，保证其在Major Compaction的过程中不被修改。
+
+- **`filenum_to_level_`的多线程支持。**

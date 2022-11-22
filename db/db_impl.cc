@@ -738,6 +738,7 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   if (s.ok() && meta.file_size > 0) {
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest, meta.area);
+    score_table_->AddItem(meta.number);
   } else {
     filenum_to_level_->erase(meta.number);
   }
@@ -1169,7 +1170,8 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
     if (hot_cold_separation_) {
-      filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
+        filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
+        score_table_->AddItem(output_number);
     }
     Iterator* iter =
         table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
@@ -1180,6 +1182,11 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
           (unsigned long long)output_number, compact->compaction->level(),
           (unsigned long long)current_entries,
           (unsigned long long)current_bytes);
+    } else {
+      if (hot_cold_separation_) {
+        filenum_to_level_->erase(output_number);
+        score_table_->RemoveSstScore(output_number);
+      }
     }
   }
   return s;
@@ -1840,7 +1847,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
         }
       }
       if (!have_stat_update) {
-        s = current->Get(options, lkey, value, &stats);
+        s = hot_cold_separation_ ? current->GetWithSeparation(options, lkey, value, &stats) : current->Get(options, lkey, value, &stats);
         have_stat_update = true;
       }
       // if (tag1 && !tag2) {

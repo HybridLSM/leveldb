@@ -18,16 +18,18 @@ class ScoreTable {
     }
     ~ScoreTable(){}
 
+    void AddItem(uint64_t sst_id) {
+      score_table_[sst_id] = 0;
+    }
+
     void AddScore(uint64_t sst_id) {
       auto it = score_table_.find(sst_id);
       if (it != score_table_.end()) {
-        score_table_[sst_id] = it->second + 1;
-      } else {
-        score_table_[sst_id] = 1;
-      }
-      if (score_table_[sst_id] > cur_highest_.score) {
-        cur_highest_.sst_id = sst_id;
-        cur_highest_.score = score_table_[sst_id];
+        score_table_[sst_id] = it->second + 1;       
+        if (score_table_[sst_id] > cur_highest_.score) {
+          cur_highest_.sst_id = sst_id;
+          cur_highest_.score = score_table_[sst_id];
+        }
       }
     }
 
