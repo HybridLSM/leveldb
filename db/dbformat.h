@@ -247,6 +247,13 @@ enum FileArea {
   fWarm = 0x2
 };
 
+inline
+int CalFileToLevel(int level, FileArea area) {
+  return area == FileArea::fNormal ? level : config::kNumLevels + (int)area;
+}
+
+enum Disk { SSD, HDD };
+
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_DBFORMAT_H_

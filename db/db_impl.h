@@ -14,6 +14,7 @@
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
+#include "db/directory_manager.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "port/port.h"
@@ -182,7 +183,7 @@ class DBImpl : public DB {
   bool hot_cold_separation_;
   std::string ssd_path_;
   std::string hdd_path_;
-  std::unordered_map<uint64_t, int>* const filenum_to_level_;
+  DirectoryManager *dir_manager_;
   KeyUpdLru* const key_upd_lru_;
   ScoreTable* const score_table_;
   HotTable* const hot_table_;

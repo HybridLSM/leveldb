@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
-
+#include "db/directory_manager.h"
 #include "db/dbformat.h"
 #include "leveldb/cache.h"
+#include "leveldb/iterator.h"
+#include "leveldb/options.h"
 #include "leveldb/table.h"
 #include "port/port.h"
 
@@ -22,7 +24,7 @@ class Env;
 
 class TableCache {
  public:
-  TableCache(const std::string& dbname, const Options& options, int entries, std::unordered_map<uint64_t, int>* filenum_to_level = nullptr);
+  TableCache(const std::string& dbname, const Options& options, int entries, DirectoryManager* dir_manager = nullptr);
 
   TableCache(const TableCache&) = delete;
   TableCache& operator=(const TableCache&) = delete;
@@ -39,6 +41,9 @@ class TableCache {
   Iterator* NewIterator(const ReadOptions& options, uint64_t file_number,
                         uint64_t file_size, Table** tableptr = nullptr);
 
+  Iterator* NewCompactionIterator(const ReadOptions& options, uint64_t file_number,
+                                  uint64_t file_size, Table** tableptr = nullptr);
+
   // If a seek to internal key "k" in specified file finds an entry,
   // call (*handle_result)(arg, found_key, found_value).
   Status Get(const ReadOptions& options, uint64_t file_number,
@@ -48,18 +53,19 @@ class TableCache {
   // Evict any entry for the specified file number
   void Evict(uint64_t file_number);
 
-  std::unordered_map<uint64_t, int>* GetFileNumToLevel() {
-    return filenum_to_level_;
+  DirectoryManager* GetDirManager() {
+    return dir_manager_;
   }
 
  private:
   Status FindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
+  Status CompactionFindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
 
   Env* const env_;
   const std::string dbname_;
   const Options& options_;
   Cache* cache_;
-  std::unordered_map<uint64_t, int>* const filenum_to_level_;
+  DirectoryManager* dir_manager_;
 };
 
 }  // namespace leveldb

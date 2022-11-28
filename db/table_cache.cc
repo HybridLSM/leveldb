@@ -30,12 +30,12 @@ static void UnrefEntry(void* arg1, void* arg2) {
 }
 
 TableCache::TableCache(const std::string& dbname, const Options& options,
-                       int entries, std::unordered_map<uint64_t, int>* filenum_to_level)
+                       int entries, DirectoryManager* dir_manager)
     : env_(options.env),
       dbname_(dbname),
       options_(options),
       cache_(NewLRUCache(entries)),
-      filenum_to_level_(filenum_to_level) {}
+      dir_manager_(dir_manager) {}
 
 TableCache::~TableCache() { delete cache_; }
 
@@ -52,8 +52,11 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
     if (!options_.hot_cold_separation) {
       fname = TableFileName(dbname_, file_number);
     } else {
-      int level = (*filenum_to_level_)[file_number];
-      fname = TableFileName(level == 0 || level > config::kNumLevels ? options_.ssd_path : options_.hdd_path, file_number);
+      std::string file_path = dir_manager_->GetFileDiskPath(file_number, &s);
+      if (!s.ok()) { // Failed in file migration
+        return s;
+      }
+      fname = TableFileName(file_path, file_number);
     }
     RandomAccessFile* file = nullptr;
     Table* table = nullptr;
@@ -63,8 +66,11 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
       if (!options_.hot_cold_separation) {
         old_fname = SSTTableFileName(dbname_, file_number);
       } else {
-        int level = (*filenum_to_level_)[file_number];
-        old_fname = SSTTableFileName(level == 0 || level > config::kNumLevels ? options_.ssd_path : options_.hdd_path, file_number);
+        std::string file_path = dir_manager_->GetFileDiskPath(file_number, &s);
+        if (!s.ok()) { // Failed in file migration
+          return s;
+        }
+        old_fname = SSTTableFileName(file_path, file_number);
       }
       if (env_->NewRandomAccessFile(old_fname, &file).ok()) {
         s = Status::OK();
@@ -98,6 +104,84 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
 
   Cache::Handle* handle = nullptr;
   Status s = FindTable(file_number, file_size, &handle);
+  if (!s.ok()) {
+    return NewErrorIterator(s);
+  }
+
+  Table* table = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+  Iterator* result = table->NewIterator(options);
+  result->RegisterCleanup(&UnrefEntry, cache_, handle);
+  if (tableptr != nullptr) {
+    *tableptr = table;
+  }
+  return result;
+}
+
+Status TableCache::CompactionFindTable(uint64_t file_number, uint64_t file_size,
+                             Cache::Handle** handle) {
+  Status s;
+  char buf[sizeof(file_number)];
+  EncodeFixed64(buf, file_number);
+  Slice key(buf, sizeof(buf));
+  *handle = cache_->Lookup(key);
+  if (*handle == nullptr) {
+
+    std::string fname;
+    if (!options_.hot_cold_separation) {
+      fname = TableFileName(dbname_, file_number);
+    } else {
+      std::string file_path = dir_manager_->CompactionGetFileDiskPath(file_number, &s);
+      if (!s.ok()) { // Failed in file migration
+        return s;
+      }
+      fname = TableFileName(file_path, file_number);
+    }
+    RandomAccessFile* file = nullptr;
+    Table* table = nullptr;
+    s = env_->NewRandomAccessFile(fname, &file);
+    if (!s.ok()) {
+      std::string old_fname;
+      if (!options_.hot_cold_separation) {
+        old_fname = SSTTableFileName(dbname_, file_number);
+      } else {
+        std::string file_path = dir_manager_->CompactionGetFileDiskPath(file_number, &s);
+        if (!s.ok()) { // Failed in file migration
+          return s;
+        }
+        old_fname = SSTTableFileName(file_path, file_number);
+      }
+      if (env_->NewRandomAccessFile(old_fname, &file).ok()) {
+        s = Status::OK();
+      }
+    }
+    if (s.ok()) {
+      s = Table::Open(options_, file, file_size, &table);
+    }
+
+    if (!s.ok()) {
+      assert(table == nullptr);
+      delete file;
+      // We do not cache error results so that if the error is transient,
+      // or somebody repairs the file, we recover automatically.
+    } else {
+      TableAndFile* tf = new TableAndFile;
+      tf->file = file;
+      tf->table = table;
+      *handle = cache_->Insert(key, tf, 1, &DeleteEntry);
+    }
+  }
+  return s;
+}
+
+Iterator* TableCache::NewCompactionIterator(const ReadOptions& options,
+                                  uint64_t file_number, uint64_t file_size,
+                                  Table** tableptr) {
+  if (tableptr != nullptr) {
+    *tableptr = nullptr;
+  }
+
+  Cache::Handle* handle = nullptr;
+  Status s = CompactionFindTable(file_number, file_size, &handle);
   if (!s.ok()) {
     return NewErrorIterator(s);
   }
