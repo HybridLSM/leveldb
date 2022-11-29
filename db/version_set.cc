@@ -47,7 +47,7 @@ static double MaxBytesForLevel(const Options* options, int level) {
   // the level-0 compaction threshold based on number of files.
 
   // Result for both level-0 and level-1
-  double result = 10. * 1048576.0;
+  double result = 30. * 1048576.0;
   while (level > 1) {
     result *= 10;
     level--;
@@ -2388,13 +2388,14 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
   const int level = c->level();
   InternalKey smallest, largest;
 
-  AddBoundaryInputs(icmp_, current_->files_[level], &c->inputs_[0]);
-  GetRange(c->inputs_[0], &smallest, &largest);
-
-  if (c->inputs_[0].empty()) {
+  if (!c->inputs_[0].empty()){
+    AddBoundaryInputs(icmp_, current_->files_[level], &c->inputs_[0]);
+    GetRange(c->inputs_[0], &smallest, &largest);
+  } else {
     assert(!c->hw_input_.empty());
     GetRange(c->hw_input_, &smallest, &largest);
   }
+  
   if (level == 0) {
     current_->GetOverlappingHWInputs(FileArea::fHot, &smallest, &largest, &c->hw_input_);
     AddBoundaryInputs(icmp_, current_->hot_files_, &c->hw_input_);

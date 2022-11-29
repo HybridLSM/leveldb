@@ -1490,9 +1490,12 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
       compact->compaction->level() + 1,
       compact->compaction->num_hw_input_files());
 
-  assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
+  assert(compact->hot_builder == nullptr);
+  assert(compact->hot_outfile == nullptr);
+  assert(compact->warm_builder == nullptr);
+  assert(compact->warm_outfile == nullptr);
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
