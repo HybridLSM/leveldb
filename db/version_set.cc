@@ -2189,18 +2189,31 @@ Compaction* VersionSet::PickCompactionWithSeparation() {
     assert(level + 1 < config::kNumLevels);
     c = new Compaction(options_, level);
 
-    // Pick the first file that comes after compact_pointer_[level]
-    for (size_t i = 0; i < current_->files_[level].size(); i++) {
-      FileMetaData* f = current_->files_[level][i];
-      if (compact_pointer_[level].empty() ||
-          icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0) {
-        c->inputs_[0].push_back(f);
-        break;
+    if (!current_->files_[level].empty()) {
+      // Pick the first file that comes after compact_pointer_[level]
+      for (size_t i = 0; i < current_->files_[level].size(); i++) {
+        FileMetaData* f = current_->files_[level][i];
+        if (compact_pointer_[level].empty() ||
+            icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0) {
+          c->inputs_[0].push_back(f);
+          break;
+        }
       }
-    }
-    if (c->inputs_[0].empty()) {
-      // Wrap-around to the beginning of the key space
-      c->inputs_[0].push_back(current_->files_[level][0]);
+      if (c->inputs_[0].empty()) {
+        // Wrap-around to the beginning of the key space
+        c->inputs_[0].push_back(current_->files_[level][0]);
+      }
+    } else {
+      assert(level == 1 || level == 2);
+      if (level == 1) {
+        assert(!current_->hot_files_.empty());
+        c->hw_input_.push_back(current_->hot_files_[0]);
+        c->level_ = 0;
+      } else {
+        assert(!current_->warm_files_.empty());
+        c->hw_input_.push_back(current_->warm_files_[0]);
+        c->level_ = 1;
+      }
     }
   } else if (score_compaction) {
     level = current_->file_to_compact_level_;
@@ -2378,6 +2391,10 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
   AddBoundaryInputs(icmp_, current_->files_[level], &c->inputs_[0]);
   GetRange(c->inputs_[0], &smallest, &largest);
 
+  if (c->inputs_[0].empty()) {
+    assert(!c->hw_input_.empty());
+    GetRange(c->hw_input_, &smallest, &largest);
+  }
   if (level == 0) {
     current_->GetOverlappingHWInputs(FileArea::fHot, &smallest, &largest, &c->hw_input_);
     AddBoundaryInputs(icmp_, current_->hot_files_, &c->hw_input_);
@@ -2411,9 +2428,11 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
   // We update this immediately instead of waiting for the VersionEdit
   // to be applied so that if the compaction fails, we will try a different
   // key range next time.
-  GetRange(c->inputs_[0], &smallest, &largest);
-  compact_pointer_[level] = largest.Encode().ToString();
-  c->edit_.SetCompactPointer(level, largest);
+  if (!c->inputs_[0].empty()) {
+    GetRange(c->inputs_[0], &smallest, &largest);
+    compact_pointer_[level] = largest.Encode().ToString();
+    c->edit_.SetCompactPointer(level, largest);
+  }
 }
 
 Compaction* VersionSet::CompactRange(int level, const InternalKey* begin,
