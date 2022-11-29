@@ -200,6 +200,7 @@ class Repairer {
 
     // Do not record a version edit for this conversion to a Table
     // since ExtractMetaData() will also generate edits.
+    // TODO: need to add support for recover from files
     FileMetaData meta;
     meta.number = next_file_number_++;
     Iterator* iter = mem->NewIterator();

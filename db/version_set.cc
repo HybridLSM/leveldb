@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "db/dbformat.h"
+#include "db/directory_manager.h"
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
@@ -229,7 +231,7 @@ static Iterator* GetFileIteratorWithFileNum(void* arg, const ReadOptions& option
         Status::Corruption("FileReader invoked with unexpected value"));
   } else {
     return NewIteratorWithFileNumber(DecodeFixed64(file_value.data()), 
-                                    cache->NewIterator(options, DecodeFixed64(file_value.data()), DecodeFixed64(file_value.data() + 8)));
+                                    cache->NewCompactionIterator(options, DecodeFixed64(file_value.data()), DecodeFixed64(file_value.data() + 8)));
   }
 }
 
@@ -432,15 +434,15 @@ void Version::ForEachOverlappingWithSeparation(Slice user_key, Slice internal_ke
 }
 
 void Version::ForFileNum(Slice user_key, const uint64_t& file_num, 
-                          const std::unordered_map<uint64_t, int>* filenum_to_level, 
                           void* arg,
                           bool (*func)(void*, int, FileMetaData*)) {
   const Comparator* ucmp = vset_->icmp_.user_comparator();
 
-  auto it = filenum_to_level->find(file_num);
-  if (it == filenum_to_level->end()) {
+  auto it = file_to_level_.find(file_num);
+  if (it == file_to_level_.end()) {
     return;
   }
+
   int target_level = it->second;
 
   FileMetaData* target = nullptr;
@@ -632,8 +634,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
 }
 
 Status Version::GetByFileNum(const ReadOptions& options, const LookupKey& k,
-                              std::string* value, GetStats* stats, const uint64_t& file_num,
-                              const std::unordered_map<uint64_t, int>* filenum_to_level) {
+                              std::string* value, GetStats* stats, const uint64_t& file_num) {
   stats->seek_file = nullptr;
   stats->seek_file_level = -1;
 
@@ -705,7 +706,7 @@ Status Version::GetByFileNum(const ReadOptions& options, const LookupKey& k,
   state.saver.user_key = k.user_key();
   state.saver.value = value;
 
-  ForFileNum(state.saver.user_key, file_num, filenum_to_level, &state, &State::Match);
+  ForFileNum(state.saver.user_key, file_num, &state, &State::Match);
 
   return state.found ? state.s : Status::NotFound(Slice());
 }
@@ -965,18 +966,19 @@ bool Version::UpdateStats(const GetStats& stats) {
   return false;
 }
 
-bool Version::CheckScoreCompact(ScoreTable* score_table, std::unordered_map<uint64_t, int>* filenum_to_level, uint32_t thred) {
+bool Version::CheckScoreCompact(ScoreTable* score_table, uint32_t thred) {
     ScoreSst highest_sst = score_table->GetHighScoreSst();
     if (highest_sst.score < thred) {
       return false;
     }
 
     uint64_t target_file_num = highest_sst.sst_id;
-    auto it = filenum_to_level->find(target_file_num);
+    auto it = file_to_level_.find(target_file_num);
 
     FileMetaData* f = nullptr;
-    if (it != filenum_to_level->end()) {
+    if (it != file_to_level_.end()) {
       int level = it->second;
+      assert(level < config::kNumLevels);
       for (size_t i = 0; i < files_[level].size(); i++) {
         f = files_[level][i];
         if (f->number == target_file_num) {
@@ -1465,6 +1467,7 @@ class VersionSet::Builder {
       }
       f->refs++;
       files->push_back(f);
+      v->file_to_level_[f->number] = CalFileToLevel(level, f->area);
     }
   }
 
@@ -1475,6 +1478,7 @@ class VersionSet::Builder {
       std::vector<FileMetaData*>* files = &v->hot_files_;
       f->refs++;
       files->push_back(f);
+      v->file_to_level_[f->number] = config::kNumLevels + FileArea::fHot;
     }
   }
 
@@ -1485,6 +1489,7 @@ class VersionSet::Builder {
       std::vector<FileMetaData*>* files = &v->warm_files_;
       f->refs++;
       files->push_back(f);
+      v->file_to_level_[f->number] = config::kNumLevels + FileArea::fWarm;
     }
   }
 };
@@ -2072,7 +2077,7 @@ Iterator* VersionSet::MakeInputIteratorWithFileNumber(Compaction* c) {
         const std::vector<FileMetaData*>& files = c->inputs_[which];
         for (size_t i = 0; i < files.size(); i++) {
           list[num++] = NewIteratorWithFileNumber(files[i]->number, 
-                                                  table_cache_->NewIterator(options, files[i]->number, files[i]->file_size));
+                                                  table_cache_->NewCompactionIterator(options, files[i]->number, files[i]->file_size));
           
         }
       } else {
@@ -2379,6 +2384,10 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
     current_->GetOverlappingInputs(level + 2, &all_start, &all_limit,
                                    &c->grandparents_);
   }
+
+  // Migrate
+  DirectoryManager *dir_manager = table_cache_->GetDirManager();
+  dir_manager->FileMigrationSSD2HDD(c->hw_input_);
 
   // Update the place where we will do the next compaction for this level.
   // We update this immediately instead of waiting for the VersionEdit

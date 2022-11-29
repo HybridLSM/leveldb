@@ -151,11 +151,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       hot_cold_separation_(raw_options.hot_cold_separation),
       ssd_path_(raw_options.ssd_path),
       hdd_path_(raw_options.hdd_path),
-      filenum_to_level_(hot_cold_separation_ ? new std::unordered_map<uint64_t, int>() : nullptr),
+      dir_manager_(hot_cold_separation_ ? new DirectoryManager(raw_options.ssd_path, raw_options.hdd_path, raw_options.env) : nullptr),
       key_upd_lru_(hot_cold_separation_ ? new KeyUpdLru(options_.upd_table_size) : nullptr),
       score_table_(hot_cold_separation_ ? new ScoreTable() : nullptr),
       hot_table_(hot_cold_separation_ ? new HotTable(options_.hot_threhold, options_.warm_threhold, options_.cnter_per_key) : nullptr),
-      table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_), filenum_to_level_)),
+      table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_), dir_manager_)),
       db_lock_(nullptr),
       shutting_down_(false),
       background_work_finished_signal_(&mutex_),
@@ -172,7 +172,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {
         if (hot_cold_separation_) {
-          assert(filenum_to_level_ != nullptr);
+          assert(dir_manager_ != nullptr);
         }
       }
 
@@ -200,7 +200,7 @@ DBImpl::~DBImpl() {
     delete hot_table_;
     delete score_table_;
     delete key_upd_lru_;
-    delete filenum_to_level_;
+    delete dir_manager_;
   }
   if (owns_info_log_) {
     delete options_.info_log;
@@ -718,12 +718,8 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
-    filenum_to_level_->emplace(meta.number, meta.area == FileArea::fNormal ? level : config::kNumLevels + (int)meta.area);
-    if (level == 0 || meta.area == FileArea::fHot || meta.area == FileArea::fWarm) {
-      s = BuildTable(ssd_path_, env_, options_, table_cache_, iter, &meta, key_upd_lru_, score_table_);
-    } else {
-      s = BuildTable(hdd_path_, env_, options_, table_cache_, iter, &meta, key_upd_lru_, score_table_);
-    }
+    std::string file_path = dir_manager_->GetFileDiskPath(level, meta.area);
+    s = BuildTable(file_path, env_, options_, table_cache_, iter, &meta, dir_manager_, key_upd_lru_, score_table_);
     mutex_.Lock();
   }
 
@@ -739,8 +735,6 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest, meta.area);
     score_table_->AddItem(meta.number);
-  } else {
-    filenum_to_level_->erase(meta.number);
   }
 
   CompactionStats stats;
@@ -784,7 +778,7 @@ void DBImpl::CompactMemTable() {
     has_imm_.store(false, std::memory_order_release);
     if (hot_cold_separation_) {
       RemoveObsoleteFilesWithSeparation();
-      if (versions_->current()->CheckScoreCompact(score_table_, filenum_to_level_, options_.score_compaction_threhold)) {
+      if (versions_->current()->CheckScoreCompact(score_table_, options_.score_compaction_threhold)) {
         MaybeScheduleCompaction();
       }
     } else {
@@ -953,24 +947,26 @@ void DBImpl::BackgroundCompaction() {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
-    if (hot_cold_separation_ && c->level() == 0) {
-      env_->RenameFile(TableFileName(ssd_path_, f->number), TableFileName(hdd_path_, f->number));
+    if (hot_cold_separation_) {
+      //env_->RenameFile(TableFileName(ssd_path_, f->number), TableFileName(hdd_path_, f->number));
+      status = dir_manager_->FileTrivialMove(c->level(), f->number);
     } 
-    c->edit()->RemoveFile(c->level(), f->number);
-    c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
-                      f->largest);
-    status = versions_->LogAndApply(c->edit(), &mutex_);
     if (status.ok()) {
-        (*filenum_to_level_)[f->number] = c->level() + 1;
-    }
-    if (!status.ok()) {
+      c->edit()->RemoveFile(c->level(), f->number);
+      c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
+                        f->largest);
+      status = versions_->LogAndApply(c->edit(), &mutex_);
+      if (!status.ok()) {
+        RecordBackgroundError(status);
+      }
+      VersionSet::LevelSummaryStorage tmp;
+      Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
+          static_cast<unsigned long long>(f->number), c->level() + 1,
+          static_cast<unsigned long long>(f->file_size),
+          status.ToString().c_str(), versions_->LevelSummary(&tmp));
+    } else {
       RecordBackgroundError(status);
     }
-    VersionSet::LevelSummaryStorage tmp;
-    Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
-        static_cast<unsigned long long>(f->number), c->level() + 1,
-        static_cast<unsigned long long>(f->file_size),
-        status.ToString().c_str(), versions_->LevelSummary(&tmp));
   } else {
     CompactionState* compact = new CompactionState(c);
     status = hot_cold_separation_ ? DoCompactionWorkWithSpearation(compact) : DoCompactionWork(compact);
@@ -1126,7 +1122,8 @@ Status DBImpl::OpenCompactionHWOutputFile(CompactionState* compact, FileArea are
   }
 
   // Make the output file
-  std::string fname = TableFileName(ssd_path_, file_number);
+  std::string compaction_default_path = dir_manager_->CompactionDefaultFilePath();
+  std::string fname = TableFileName(compaction_default_path, file_number);
   Status s = env_->NewWritableFile(fname, &outfile);
   if (s.ok()) {
     builder = new TableBuilder(options_, outfile);
@@ -1167,10 +1164,17 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   delete compact->outfile;
   compact->outfile = nullptr;
 
+  Disk type;
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
     if (hot_cold_separation_) {
-        filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
+        // filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
+        type = dir_manager_->DetermineFileDisk(compact->compaction->level() + 1);
+
+        if (type == Disk::SSD) { // need migration
+          dir_manager_->FileMigrationHDD2SSD(output_number);
+        }
+        dir_manager_->RecordFileDisk(output_number, Disk::HDD);
         score_table_->AddItem(output_number);
     }
     Iterator* iter =
@@ -1184,7 +1188,7 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
           (unsigned long long)current_bytes);
     } else {
       if (hot_cold_separation_) {
-        filenum_to_level_->erase(output_number);
+        dir_manager_->EraseFileDisk(output_number, Disk::HDD);
         score_table_->RemoveSstScore(output_number);
       }
     }
@@ -1232,10 +1236,16 @@ Status DBImpl::FinishCompactionHWOutputFile(CompactionState* compact,
   delete outfile;
   outfile = nullptr;
 
+  Disk type;
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
     if (hot_cold_separation_) {
-      filenum_to_level_->emplace(output_number, config::kNumLevels + area);
+      // filenum_to_level_->emplace(output_number, config::kNumLevels + area);
+      type = dir_manager_->DetermineFileDisk(config::kNumLevels, area);
+      if (type == Disk::SSD) { // need migration
+        dir_manager_->FileMigrationHDD2SSD(output_number);
+      }
+      dir_manager_->RecordFileDisk(output_number, Disk::HDD);
     }
     Iterator* iter =
         table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
@@ -1246,6 +1256,10 @@ Status DBImpl::FinishCompactionHWOutputFile(CompactionState* compact,
           (unsigned long long)output_number, compact->compaction->level(),
           (unsigned long long)current_entries,
           (unsigned long long)current_bytes);
+    } else {
+      if (hot_cold_separation_) {
+        dir_manager_->EraseFileDisk(output_number, Disk::HDD);
+      }
     }
   }
   return s;
@@ -1464,6 +1478,7 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
   assert(hot_table_ != nullptr);
   assert(key_upd_lru_ != nullptr);
   assert(score_table_ != nullptr);
+  assert(dir_manager_ != nullptr);
 
   const uint64_t start_micros = env_->NowMicros();
   int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
@@ -1655,6 +1670,9 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
             output = compact->current_output();
             builder = compact->builder;
             break;
+          
+          default:
+            break;
         }
         if (!status.ok()) {
           break;
@@ -1840,7 +1858,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
       // bool tag1 = false, tag2 = false;
       if (hot_cold_separation_ && key_upd_lru_->FindSst(key, &target_file_num)) {
         // tag1 = true;
-        s = current->GetByFileNum(options, lkey, value, &stats, target_file_num, filenum_to_level_);
+        s = current->GetByFileNum(options, lkey, value, &stats, target_file_num);
         if (s.ok()) {
           // tag2 = true;
           have_stat_update = true;
