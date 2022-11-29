@@ -86,6 +86,24 @@ Version::~Version() {
       }
     }
   }
+
+  for (size_t i = 0; i < hot_files_.size(); i++) {
+    FileMetaData* f = hot_files_[i];
+    assert(f->refs > 0);
+    f->refs--;
+    if (f->refs <= 0) {
+      delete f;
+    }
+  }
+
+  for (size_t i = 0; i < warm_files_.size(); i++) {
+    FileMetaData* f = warm_files_[i];
+    assert(f->refs > 0);
+    f->refs--;
+    if (f->refs <= 0) {
+      delete f;
+    }
+  }
 }
 
 int FindFile(const InternalKeyComparator& icmp,

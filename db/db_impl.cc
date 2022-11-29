@@ -709,6 +709,7 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
     if (base != nullptr) {
       level = base->PickLevelForMemTableOutputWithSeparation(smallest_internal_key.user_key(), largest_internal_key.user_key(), &meta.area);
     }
+    delete iter;
   }
 
   Iterator* iter = mem->NewIterator();
