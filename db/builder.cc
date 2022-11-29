@@ -5,6 +5,7 @@
 #include "db/builder.h"
 
 #include "db/dbformat.h"
+#include "db/directory_manager.h"
 #include "db/filename.h"
 #include "db/table_cache.h"
 #include "db/version_edit.h"
@@ -16,11 +17,13 @@
 
 namespace leveldb {
 
-Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta, KeyUpdLru* key_upd, ScoreTable* score_table) {
+Status BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache, 
+                  Iterator* iter, FileMetaData* meta, DirectoryManager* dir_manager,
+                  KeyUpdLru* key_upd, ScoreTable* score_table) {
   if (options.hot_cold_separation) {
     assert(key_upd != nullptr);
     assert(score_table != nullptr);
+    assert(dir_manager != nullptr);
   }
 
   Status s;
@@ -70,6 +73,10 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     file = nullptr;
 
     if (s.ok()) {
+      if (options.hot_cold_separation) {
+        dir_manager->RecordFileDisk(meta->number, dbname);
+      }
+
       // Verify that the table is usable
       Iterator* it = table_cache->NewIterator(ReadOptions(), meta->number,
                                               meta->file_size);
@@ -86,6 +93,9 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
   if (s.ok() && meta->file_size > 0) {
     // Keep it
   } else {
+    if (options.hot_cold_separation) {
+      dir_manager->EraseFileDisk(meta->number, dbname);
+    }
     env->RemoveFile(fname);
   }
   return s;

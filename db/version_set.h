@@ -22,6 +22,7 @@
 
 #include "db/dbformat.h"
 #include "db/version_edit.h"
+#include "db/directory_manager.h"
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
@@ -83,7 +84,7 @@ class Version {
   // Else return a non-OK status.  Fills *stats.
   // REQUIRES: lock is not held
   Status GetByFileNum(const ReadOptions&, const LookupKey& key, std::string* val,
-                      GetStats* stats, const uint64_t& file_num, const std::unordered_map<uint64_t, int>* filenum_to_level);
+                      GetStats* stats, const uint64_t& file_num);
 
   // Lookup the value for key when hot_cold_separation_ is true. If found, store it in *val and
   // return OK.  Else return a non-OK status.  Fills *stats.
@@ -106,7 +107,7 @@ class Version {
   // REQUIRES: lock is held
   bool UpdateStats(const GetStats& stats);
 
-  bool CheckScoreCompact(ScoreTable* score_table, std::unordered_map<uint64_t, int>* filenum_to_level, uint32_t thred);
+  bool CheckScoreCompact(ScoreTable* score_table, uint32_t thred);
 
   // Record a sample of bytes read at the specified internal key.
   // Samples are taken approximately once every config::kReadBytesPeriod
@@ -182,7 +183,7 @@ class Version {
   void ForEachOverlappingWithSeparation(Slice user_key, Slice internal_key, void* arg,
                           bool (*func)(void*, int, FileMetaData*));
 
-  void ForFileNum(Slice user_key, const uint64_t& file_num, const std::unordered_map<uint64_t, int>* filenum_to_level, void* arg,
+  void ForFileNum(Slice user_key, const uint64_t& file_num, void* arg,
                           bool (*func)(void*, int, FileMetaData*));
 
   void ForLevels(Slice user_key, Slice internal_key, int min_level, int max_level, void* arg,
@@ -200,6 +201,7 @@ class Version {
   std::vector<FileMetaData*> files_[config::kNumLevels];
   std::vector<FileMetaData*> hot_files_;
   std::vector<FileMetaData*> warm_files_;
+  std::unordered_map<uint64_t, int> file_to_level_;
 
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;

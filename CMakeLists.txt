@@ -147,6 +147,7 @@ target_sources(leveldb
     "db/sst_score_table.h"
     "db/table_cache.cc"
     "db/table_cache.h"
+    "db/directory_manager.h"
     "db/version_edit.cc"
     "db/version_edit.h"
     "db/version_set.cc"

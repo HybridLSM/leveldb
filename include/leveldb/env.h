@@ -167,6 +167,10 @@ class LEVELDB_EXPORT Env {
   // Rename file src to target.
   virtual Status RenameFile(const std::string& src,
                             const std::string& target) = 0;
+  
+  // 
+  virtual Status MigrationFile(const std::string& from, 
+                               const std::string& to) = 0;
 
   // Lock the specified file.  Used to prevent concurrent access to
   // the same db by multiple processes.  On failure, stores nullptr in
@@ -376,6 +380,9 @@ class LEVELDB_EXPORT EnvWrapper : public Env {
   }
   Status RenameFile(const std::string& s, const std::string& t) override {
     return target_->RenameFile(s, t);
+  }
+  Status MigrationFile(const std::string& s, const std::string& t) override {
+    return target_->MigrationFile(s, t);
   }
   Status LockFile(const std::string& f, FileLock** l) override {
     return target_->LockFile(f, l);
