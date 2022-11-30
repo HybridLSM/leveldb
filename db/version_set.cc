@@ -2379,7 +2379,7 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
     GetRange2(c->inputs_[0], c->hw_input_, &smallest, &largest);
   } else if (level == 1) {
     current_->GetOverlappingHWInputs(FileArea::fWarm, &smallest, &largest, &c->hw_input_);
-    AddBoundaryInputs(icmp_, current_->hot_files_, &c->hw_input_);
+    AddBoundaryInputs(icmp_, current_->warm_files_, &c->hw_input_);
     GetRange2(c->inputs_[0], c->hw_input_, &smallest, &largest);
   }
 
