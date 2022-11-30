@@ -691,7 +691,7 @@ Status DBImpl::WriteLevel0TableWithSeparation(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
-    if (level <= 1) {
+    if (level <= config::kMaxSSDLevel) {
       s = BuildTableWithSeparation(ssd_path_, env_, options_, table_cache_, iter, &meta, level);
     } else {
       s = BuildTableWithSeparation(hdd_path_, env_, options_, table_cache_, iter, &meta, level);
@@ -915,7 +915,7 @@ void DBImpl::BackgroundCompaction() {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
-    if (hot_cold_separation_ && c->level() == 1) {
+    if (hot_cold_separation_ && c->level() == config::kMaxSSDLevel) {
       std::rename(TableFileName(ssd_path_, f->number).c_str(), TableFileName(hdd_path_, f->number).c_str());
     } 
     c->edit()->RemoveFile(c->level(), f->number);

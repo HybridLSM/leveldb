@@ -13,6 +13,7 @@
 #include "leveldb/db.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/slice.h"
+#include "leveldb/status.h"
 #include "leveldb/table_builder.h"
 #include "util/coding.h"
 #include "util/logging.h"
@@ -43,6 +44,9 @@ static const int kMaxMemCompactLevel = 2;
 
 // Approximate gap in bytes between samples of data read during iteration.
 static const int kReadBytesPeriod = 1048576;
+
+// Max Level store in SSD path
+static const int kMaxSSDLevel = 2;
 
 }  // namespace config
 

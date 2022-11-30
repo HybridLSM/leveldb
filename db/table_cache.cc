@@ -84,7 +84,7 @@ Status TableCache::FindTableWithSeparation(uint64_t file_number, uint64_t file_s
   *handle = cache_->Lookup(key);
   if (*handle == nullptr) {
     std::string fname;
-    if (level <= 1) {
+    if (level <= config::kMaxSSDLevel) {
       fname = TableFileName(options_.ssd_path, file_number);
     } else {
       fname = TableFileName(options_.hdd_path, file_number);
@@ -94,7 +94,7 @@ Status TableCache::FindTableWithSeparation(uint64_t file_number, uint64_t file_s
     s = env_->NewRandomAccessFile(fname, &file);
     if (!s.ok()) {
       std::string old_fname;
-      if (level <= 1) {
+      if (level <= config::kMaxSSDLevel) {
         old_fname = SSTTableFileName(options_.ssd_path, file_number);
       } else {
         old_fname = SSTTableFileName(options_.hdd_path, file_number);

@@ -1,6 +1,6 @@
 # Change Log
 
-## Task 1: 简单将SST存储路径分开，将Level 0和Level 1的SST放置在SSD下，其余放置在HDD下。
+## Task 1: 简单将SST存储路径分开，将Level 0、Level 1和Level 2的SST放置在SSD下，其余放置在HDD下。
 ### 需要改动的地方：
   1. 需要添加冷热分离的开关，添加SSD和HDD的路径设置选项，令SSD为主要路径，即MANIFEST等文件的存放路径。
   2. 对于Minor Compaction，因为不一定会直接落入Level 0，需要对最终落入的Level进行判断，以此改变落盘路径。~~在这过程中可能会读取不同Level的SST文件，需要修改读取路径~~（这里不会读取文件，而是直接通过file meta内的smallest和largest进行判断）。（相关过程可以参考[LevelDB源码解析(12) Memtable落盘](https://www.huliujia.com/blog/124132a9b3/)）
