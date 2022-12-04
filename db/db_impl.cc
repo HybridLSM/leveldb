@@ -757,6 +757,9 @@ void DBImpl::CompactMemTable() {
       RemoveObsoleteFiles();
     }
   } else {
+    Log(options_.info_log, 
+        "Error occurs in CompactMemTable, error message : %s",
+        s.ToString().c_str());
     RecordBackgroundError(s);
   }
 }
@@ -923,6 +926,9 @@ void DBImpl::BackgroundCompaction() {
                       f->largest);
     status = versions_->LogAndApply(c->edit(), &mutex_);
     if (!status.ok()) {
+      Log(options_.info_log, 
+        "Error occurs in BackgroundCompaction 929, error message : %s",
+        status.ToString().c_str());
       RecordBackgroundError(status);
     }
     VersionSet::LevelSummaryStorage tmp;
@@ -934,6 +940,9 @@ void DBImpl::BackgroundCompaction() {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
     if (!status.ok()) {
+      Log(options_.info_log, 
+        "Error occurs in BackgroundCompaction 944, error message : %s",
+        status.ToString().c_str());
       RecordBackgroundError(status);
     }
     CleanupCompaction(compact);
@@ -1232,6 +1241,9 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     status = InstallCompactionResults(compact);
   }
   if (!status.ok()) {
+    Log(options_.info_log, 
+        "Error occurs in DoCompactionWork, error message : %s",
+        status.ToString().c_str());
     RecordBackgroundError(status);
   }
   VersionSet::LevelSummaryStorage tmp;
@@ -1330,11 +1342,26 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     LookupKey lkey(key, snapshot);
     if (mem->Get(lkey, value, &s)) {
       // Done
+      if (!s.ok()) {
+        Log(options_.info_log, 
+            "Error occurs in mem->Get, error message : %s",
+            s.ToString().c_str());
+      }
     } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
       // Done
+      if (!s.ok()) {
+        Log(options_.info_log, 
+            "Error occurs in imm->Get, error message : %s",
+            s.ToString().c_str());
+      }
     } else {
       s = current->Get(options, lkey, value, &stats);
       have_stat_update = true;
+      if (!s.ok()) {
+        Log(options_.info_log, 
+            "Error occurs in current->Get, error message : %s",
+            s.ToString().c_str());
+      }
     }
     mutex_.Lock();
   }
@@ -1432,12 +1459,19 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
         // So we force the DB into a mode where all future writes fail.
+        Log(options_.info_log, 
+        "Error occurs in Write, error message : %s",
+        status.ToString().c_str());
         RecordBackgroundError(status);
       }
     }
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
 
     versions_->SetLastSequence(last_sequence);
+  } else if (!status.ok()) {
+    Log(options_.info_log, 
+        "Error occurs in MakeRoomForWrite, error message : %s",
+        status.ToString().c_str());
   }
 
   while (true) {
