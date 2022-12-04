@@ -244,6 +244,7 @@ class DirectoryManager {
       // Wait until new work come in
       while (files_to_migrate_s2h_.empty()) {
         consume_s2h_.Wait();
+        assert(mutex_.AssertHeld());
         
         if (end_) {
           break;
@@ -299,7 +300,8 @@ class DirectoryManager {
       // Wait until new work come in
       while (files_to_migrate_h2s_.empty()) {
         consume_h2s_.Wait();
-
+        assert(mutex_.AssertHeld());
+        
         if (end_) {
           break;
         }
