@@ -2107,7 +2107,7 @@ Iterator* VersionSet::MakeInputIteratorWithFileNumber(Compaction* c) {
     const std::vector<FileMetaData*>& files = c->hw_input_;
     for (size_t i = 0; i < files.size(); i++) {
       list[num++] = NewIteratorWithFileNumber(files[i]->number,
-                                              table_cache_->NewIterator(options, files[i]->number, files[i]->file_size));
+                                              table_cache_->NewCompactionIterator(options, files[i]->number, files[i]->file_size));
     }
   }
   assert(num <= space);
@@ -2400,7 +2400,9 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
 
   // Migrate
   DirectoryManager *dir_manager = table_cache_->GetDirManager();
-  dir_manager->FileMigrationSSD2HDD(c->hw_input_);
+  if (c->level() == 0)  // Migrate level 0 files
+    dir_manager->FileMigrationSSD2HDD(c->inputs_[0]);
+  dir_manager->FileMigrationSSD2HDD(c->hw_input_); 
 
   // Update the place where we will do the next compaction for this level.
   // We update this immediately instead of waiting for the VersionEdit

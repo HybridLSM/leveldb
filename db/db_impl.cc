@@ -1502,11 +1502,9 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
   }
 
-  Iterator* input = versions_->MakeInputIteratorWithFileNumber(compact->compaction);
-
   // Release mutex while we're actually doing the compaction work
   mutex_.Unlock();
-
+  Iterator* input = versions_->MakeInputIteratorWithFileNumber(compact->compaction);
   input->SeekToFirst();
   Status status;
   ParsedInternalKey ikey;
