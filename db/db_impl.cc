@@ -919,12 +919,17 @@ void DBImpl::BackgroundCompaction() {
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
     if (hot_cold_separation_ && c->level() == config::kMaxSSDLevel) {
-      std::rename(TableFileName(ssd_path_, f->number).c_str(), TableFileName(hdd_path_, f->number).c_str());
-    } 
-    c->edit()->RemoveFile(c->level(), f->number);
-    c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
-                      f->largest);
-    status = versions_->LogAndApply(c->edit(), &mutex_);
+      status = env_->MigrationFile(TableFileName(ssd_path_, f->number), TableFileName(hdd_path_, f->number));
+      if (status.ok()) {  // remove origin file
+        status = env_->RemoveFile(TableFileName(ssd_path_, f->number));
+      }
+    }
+    if (status.ok()) {
+      c->edit()->RemoveFile(c->level(), f->number);
+      c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
+                        f->largest);
+      status = versions_->LogAndApply(c->edit(), &mutex_);
+    }
     if (!status.ok()) {
       Log(options_.info_log, 
         "Error occurs in BackgroundCompaction 929, error message : %s",
