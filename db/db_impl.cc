@@ -1012,7 +1012,13 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   }
 
   // Make the output file
-  std::string fname = TableFileName(dbname_, file_number);
+  std::string fname;
+  if (!hot_cold_separation_) {
+    fname = TableFileName(dbname_, file_number);
+  } else {
+    int level = compact->compaction->level() + 1;
+    fname = TableFileName(level <= config::kMaxSSDLevel ? options_.ssd_path : options_.hdd_path, file_number);
+  }
   Status s = env_->NewWritableFile(fname, &compact->outfile);
   if (s.ok()) {
     compact->builder = new TableBuilder(options_, compact->outfile);
@@ -1055,8 +1061,15 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
-    Iterator* iter =
+    Iterator* iter;
+    if (!hot_cold_separation_) {
+      iter =
         table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
+    } else {
+      int level = compact->compaction->level() + 1;
+      iter =
+        table_cache_->NewIteratorWithSeparation(ReadOptions(), output_number, current_bytes, level);
+    }
     s = iter->status();
     delete iter;
     if (s.ok()) {
@@ -1355,7 +1368,8 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
             s.ToString().c_str());
       }
     } else {
-      s = current->Get(options, lkey, value, &stats);
+      s = hot_cold_separation_ ? current->GetWithSeparation(options, lkey, value, &stats) 
+                               : current->Get(options, lkey, value, &stats);
       have_stat_update = true;
       if (!s.ok()) {
         Log(options_.info_log, 

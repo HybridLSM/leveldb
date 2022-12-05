@@ -180,6 +180,19 @@ Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
   return s;
 }
 
+Status TableCache::GetWithSeparation(const ReadOptions& options, uint64_t file_number,
+                                     uint64_t file_size, int level, const Slice& k, void* arg,
+                                     void (*handle_result)(void*, const Slice&, const Slice&)) {
+  Cache::Handle* handle = nullptr;
+  Status s = FindTableWithSeparation(file_number, file_size, &handle, level);
+  if (s.ok()) {
+    Table* t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+    s = t->InternalGet(options, k, arg, handle_result);
+    cache_->Release(handle);
+  }
+  return s;
+}
+
 void TableCache::Evict(uint64_t file_number) {
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);

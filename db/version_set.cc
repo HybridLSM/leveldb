@@ -411,6 +411,85 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
   return state.found ? state.s : Status::NotFound(Slice());
 }
 
+Status Version::GetWithSeparation(const ReadOptions& options, const LookupKey& k,
+                                  std::string* value, GetStats* stats) {
+  stats->seek_file = nullptr;
+  stats->seek_file_level = -1;
+
+  struct State {
+    Saver saver;
+    GetStats* stats;
+    const ReadOptions* options;
+    Slice ikey;
+    FileMetaData* last_file_read;
+    int last_file_read_level;
+
+    VersionSet* vset;
+    Status s;
+    bool found;
+
+    static bool Match(void* arg, int level, FileMetaData* f) {
+      State* state = reinterpret_cast<State*>(arg);
+
+      if (state->stats->seek_file == nullptr &&
+          state->last_file_read != nullptr) {
+        // We have had more than one seek for this read.  Charge the 1st file.
+        state->stats->seek_file = state->last_file_read;
+        state->stats->seek_file_level = state->last_file_read_level;
+      }
+
+      // state->stats->cur_filenum = f->number;
+      state->last_file_read = f;
+      state->last_file_read_level = level;
+
+      state->s = state->vset->table_cache_->GetWithSeparation(*state->options, f->number,
+                                                f->file_size, level, state->ikey,
+                                                &state->saver, SaveValue);
+      if (!state->s.ok()) {
+        state->found = true;
+        return false;
+      }
+      switch (state->saver.state) {
+        case kNotFound:
+          return true;  // Keep searching in other files
+        case kFound:
+          state->found = true;
+          return false;
+        case kDeleted:
+          return false;
+        case kCorrupt:
+          state->s =
+              Status::Corruption("corrupted key for ", state->saver.user_key);
+          state->found = true;
+          return false;
+      }
+
+      // Not reached. Added to avoid false compilation warnings of
+      // "control reaches end of non-void function".
+      return false;
+    }
+  };
+
+  State state;
+  state.found = false;
+  state.stats = stats;
+  state.last_file_read = nullptr;
+  state.last_file_read_level = -1;
+
+  state.options = &options;
+  state.ikey = k.internal_key();
+  state.vset = vset_;
+
+  state.saver.state = kNotFound;
+  state.saver.ucmp = vset_->icmp_.user_comparator();
+  state.saver.user_key = k.user_key();
+  state.saver.value = value;
+
+  ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
+
+  return state.found ? state.s : Status::NotFound(Slice());
+}
+
 bool Version::UpdateStats(const GetStats& stats) {
   FileMetaData* f = stats.seek_file;
   if (f != nullptr) {
@@ -1240,13 +1319,14 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   Iterator** list = new Iterator*[space];
   int num = 0;
   for (int which = 0; which < 2; which++) {
+    int level = c->level() + which;
     if (!c->inputs_[which].empty()) {
-      if (c->level() + which == 0) {
+      if (level == 0) {
         const std::vector<FileMetaData*>& files = c->inputs_[which];
         for (size_t i = 0; i < files.size(); i++) {
           list[num++] = options_->hot_cold_separation ?
                         table_cache_->NewIteratorWithSeparation(options, files[i]->number,
-                                                files[i]->file_size, c->level()) :
+                                                files[i]->file_size, level) :
                         table_cache_->NewIterator(options, files[i]->number,
                                                 files[i]->file_size);
           
@@ -1256,7 +1336,7 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
         list[num++] = options_->hot_cold_separation ? 
                       NewTwoLevelIteratorWithSeparation(
                         new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]),
-                        &GetFileIteratorWithSeparation, table_cache_, options, c->level()) :
+                        &GetFileIteratorWithSeparation, table_cache_, options, level) :
                       NewTwoLevelIterator(
                         new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]),
                         &GetFileIterator, table_cache_, options);
