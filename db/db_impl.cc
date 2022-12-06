@@ -779,9 +779,9 @@ void DBImpl::CompactMemTable() {
     has_imm_.store(false, std::memory_order_release);
     if (hot_cold_separation_) {
       RemoveObsoleteFilesWithSeparation();
-      if (versions_->current()->CheckScoreCompact(score_table_, options_.score_compaction_threhold)) {
-        MaybeScheduleCompaction();
-      }
+      // if (versions_->current()->CheckScoreCompact(score_table_, options_.score_compaction_threhold)) {
+      //   MaybeScheduleCompaction();
+      // }
     } else {
       RemoveObsoleteFiles();
     }
@@ -1773,6 +1773,8 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
   stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
+    VersionSet::LevelSummaryStorage tmp;
+    Log(options_.info_log, "Before compacted: %s", versions_->LevelSummary(&tmp));
     status = InstallCompactionResultsWithSeparation(compact);
     for (int which = 0; which < 2; which++) {
       for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
