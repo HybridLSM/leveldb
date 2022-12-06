@@ -118,22 +118,25 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
 }
 
 Status TableCache::CompactionFindTable(uint64_t file_number, uint64_t file_size,
-                             Cache::Handle** handle) {
+                             Disk compaction_disk, Cache::Handle** handle) {
   Status s;
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);
   Slice key(buf, sizeof(buf));
   *handle = cache_->Lookup(key);
   if (*handle == nullptr) {
+    std::string file_path;
+    if (options_.hot_cold_separation) {
+      file_path = dir_manager_->CompactionGetFileDiskPath(file_number, compaction_disk, &s);
+      if (!s.ok()) { // Failed in file migration
+        return s;
+      }
+    }
 
     std::string fname;
     if (!options_.hot_cold_separation) {
       fname = TableFileName(dbname_, file_number);
     } else {
-      std::string file_path = dir_manager_->CompactionGetFileDiskPath(file_number, &s);
-      if (!s.ok()) { // Failed in file migration
-        return s;
-      }
       fname = TableFileName(file_path, file_number);
     }
     RandomAccessFile* file = nullptr;
@@ -144,10 +147,6 @@ Status TableCache::CompactionFindTable(uint64_t file_number, uint64_t file_size,
       if (!options_.hot_cold_separation) {
         old_fname = SSTTableFileName(dbname_, file_number);
       } else {
-        std::string file_path = dir_manager_->CompactionGetFileDiskPath(file_number, &s);
-        if (!s.ok()) { // Failed in file migration
-          return s;
-        }
         old_fname = SSTTableFileName(file_path, file_number);
       }
       if (env_->NewRandomAccessFile(old_fname, &file).ok()) {
@@ -175,13 +174,13 @@ Status TableCache::CompactionFindTable(uint64_t file_number, uint64_t file_size,
 
 Iterator* TableCache::NewCompactionIterator(const ReadOptions& options,
                                   uint64_t file_number, uint64_t file_size,
-                                  Table** tableptr) {
+                                  Disk compaction_disk, Table** tableptr) {
   if (tableptr != nullptr) {
     *tableptr = nullptr;
   }
 
   Cache::Handle* handle = nullptr;
-  Status s = CompactionFindTable(file_number, file_size, &handle);
+  Status s = CompactionFindTable(file_number, file_size, compaction_disk, &handle);
   if (!s.ok()) {
     return NewErrorIterator(s);
   }
