@@ -2400,9 +2400,10 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
 
   // Migrate
   DirectoryManager *dir_manager = table_cache_->GetDirManager();
-  if (c->level() == 0)  // Migrate level 0 files
+  if (c->inputs_[0].size() != 0 && c->level() == 0)  // Migrate level 0 files
     dir_manager->FileMigrationSSD2HDD(c->inputs_[0]);
-  dir_manager->FileMigrationSSD2HDD(c->hw_input_); 
+  if (c->hw_input_.size() != 0)
+    dir_manager->FileMigrationSSD2HDD(c->hw_input_); 
 
   // Update the place where we will do the next compaction for this level.
   // We update this immediately instead of waiting for the VersionEdit
