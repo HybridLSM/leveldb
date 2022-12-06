@@ -1087,7 +1087,8 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   // Make the output file
   std::string fname;
   if (hot_cold_separation_) {
-    fname = TableFileName(hdd_path_, file_number);
+    std::string compaction_path = dir_manager_->GetCompactionFilePath(compact->compaction->level());
+    fname = TableFileName(compaction_path, file_number);
   } else {
     fname = TableFileName(dbname_, file_number);
   }
@@ -1123,8 +1124,8 @@ Status DBImpl::OpenCompactionHWOutputFile(CompactionState* compact, FileArea are
   }
 
   // Make the output file
-  std::string compaction_default_path = dir_manager_->CompactionDefaultFilePath();
-  std::string fname = TableFileName(compaction_default_path, file_number);
+  std::string compaction_path = dir_manager_->GetCompactionFilePath(compact->compaction->level());
+  std::string fname = TableFileName(compaction_path, file_number);
   Status s = env_->NewWritableFile(fname, &outfile);
   if (s.ok()) {
     builder = new TableBuilder(options_, outfile);
@@ -1165,31 +1166,43 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   delete compact->outfile;
   compact->outfile = nullptr;
 
-  Disk type;
+  Disk cur_disk, dst_disk;
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
     if (hot_cold_separation_) {
-        // filenum_to_level_->emplace(output_number, compact->compaction->level() + 1);
-        type = dir_manager_->DetermineFileDisk(compact->compaction->level() + 1);
+      cur_disk = dir_manager_->GetCompactionDisk(compact->compaction->level());
 
-        if (type == Disk::SSD) { // need migration
-          dir_manager_->FileMigrationHDD2SSD(output_number);
-        }
-        dir_manager_->RecordFileDisk(output_number, Disk::HDD);
-        score_table_->AddItem(output_number);
+      dir_manager_->RecordFileDisk(output_number, cur_disk);
+      score_table_->AddItem(output_number);
     }
     Iterator* iter =
         table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
     s = iter->status();
     delete iter;
     if (s.ok()) {
+      if (hot_cold_separation_) {
+        dst_disk = dir_manager_->DetermineFileDisk(compact->compaction->level() + 1, FileArea::fNormal);
+        if (cur_disk != dst_disk) { // need migration
+          if (dst_disk == Disk::SSD) {
+            dir_manager_->FileMigrationHDD2SSD(output_number);
+          } else {
+            dir_manager_->FileMigrationSSD2HDD(output_number);
+          }
+          Log(options_.info_log, "Serial migrate table #%llu from %s to %s: %lld keys, %lld bytes",
+              (unsigned long long)output_number, 
+              DiskToString(cur_disk).c_str(), 
+              DiskToString(dst_disk).c_str(), 
+              (unsigned long long)current_entries,
+              (unsigned long long)current_bytes);
+        }
+      }
       Log(options_.info_log, "Generated table #%llu@%d: %lld keys, %lld bytes",
           (unsigned long long)output_number, compact->compaction->level(),
           (unsigned long long)current_entries,
           (unsigned long long)current_bytes);
     } else {
       if (hot_cold_separation_) {
-        dir_manager_->EraseFileDisk(output_number, Disk::HDD);
+        dir_manager_->EraseFileDisk(output_number, dst_disk);
         score_table_->RemoveSstScore(output_number);
       }
     }
@@ -1237,29 +1250,42 @@ Status DBImpl::FinishCompactionHWOutputFile(CompactionState* compact,
   delete outfile;
   outfile = nullptr;
 
-  Disk type;
+  Disk cur_disk, dst_disk;
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
     if (hot_cold_separation_) {
       // filenum_to_level_->emplace(output_number, config::kNumLevels + area);
-      type = dir_manager_->DetermineFileDisk(config::kNumLevels, area);
-      if (type == Disk::SSD) { // need migration
-        dir_manager_->FileMigrationHDD2SSD(output_number);
-      }
-      dir_manager_->RecordFileDisk(output_number, Disk::HDD);
+      cur_disk = dir_manager_->GetCompactionDisk(compact->compaction->level());
+      dir_manager_->RecordFileDisk(output_number, cur_disk);
     }
     Iterator* iter =
         table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
     s = iter->status();
     delete iter;
     if (s.ok()) {
+      if (hot_cold_separation_) {
+        dst_disk = dir_manager_->DetermineFileDisk(config::kNumLevels, area);
+        if (cur_disk != dst_disk) { // need migration
+          if (dst_disk == Disk::SSD)
+            dir_manager_->FileMigrationHDD2SSD(output_number);
+          else
+            dir_manager_->FileMigrationSSD2HDD(output_number);
+        
+          Log(options_.info_log, "Serial migrate table #%llu from %s to %s: %lld keys, %lld bytes",
+              (unsigned long long)output_number, 
+              DiskToString(cur_disk).c_str(), 
+              DiskToString(dst_disk).c_str(), 
+              (unsigned long long)current_entries,
+              (unsigned long long)current_bytes);
+        }
+      }
       Log(options_.info_log, "Generated table #%llu@%d: %lld keys, %lld bytes",
           (unsigned long long)output_number, compact->compaction->level(),
           (unsigned long long)current_entries,
           (unsigned long long)current_bytes);
     } else {
       if (hot_cold_separation_) {
-        dir_manager_->EraseFileDisk(output_number, Disk::HDD);
+        dir_manager_->EraseFileDisk(output_number, dst_disk);
       }
     }
   }
@@ -1854,8 +1880,18 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     uint64_t target_file_num;
     if (mem->Get(lkey, value, &s)) {
       // Done
+      if (!s.ok()) {
+        Log(options_.info_log, 
+            "Error occurs in mem->Get, error message : %s",
+            s.ToString().c_str());
+      }
     } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
       // Done
+      if (!s.ok()) {
+        Log(options_.info_log, 
+            "Error occurs in imm->Get, error message : %s",
+            s.ToString().c_str());
+      }
     } else {
       // bool tag1 = false, tag2 = false;
       if (hot_cold_separation_ && key_upd_lru_->FindSst(key, &target_file_num)) {
@@ -1869,6 +1905,11 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
       if (!have_stat_update) {
         s = hot_cold_separation_ ? current->GetWithSeparation(options, lkey, value, &stats) : current->Get(options, lkey, value, &stats);
         have_stat_update = true;
+      }
+      if (!s.ok()) {
+        Log(options_.info_log, 
+            "Error occurs in current->Get, error message : %s",
+            s.ToString().c_str());
       }
       // if (tag1 && !tag2) {
       //   std::cout << s.ok() << "\t" << target_file_num 
@@ -1978,12 +2019,19 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
         // So we force the DB into a mode where all future writes fail.
+        Log(options_.info_log, 
+            "Error occurs in Write, error message : %s",
+            status.ToString().c_str());
         RecordBackgroundError(status);
       }
     }
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
 
     versions_->SetLastSequence(last_sequence);
+  } else if (!status.ok()) {
+    Log(options_.info_log, 
+        "Error occurs in MakeRoomForWrite, error message : %s",
+        status.ToString().c_str());
   }
 
   while (true) {
@@ -2090,7 +2138,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       background_work_finished_signal_.Wait();
     } else if (versions_->NumLevelFiles(0) >= config::kL0_StopWritesTrigger) {
       // There are too many level-0 files.
-      Log(options_.info_log, "Too many L0 files; waiting...\n");
+      Log(options_.info_log, "Too many L0 files (%d in total); waiting...\n", versions_->NumLevelFiles(0));
       background_work_finished_signal_.Wait();
     } else {
       // Attempt to switch to a new memtable and trigger compaction of old

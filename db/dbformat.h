@@ -254,6 +254,12 @@ int CalFileToLevel(int level, FileArea area) {
 
 enum Disk { SSD, HDD };
 
+inline
+std::string DiskToString(Disk type) {
+  std::string result = type == Disk::SSD ? "SSD" : "HDD";
+  return result;
+}
+
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_DBFORMAT_H_

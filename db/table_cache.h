@@ -42,7 +42,7 @@ class TableCache {
                         uint64_t file_size, Table** tableptr = nullptr);
 
   Iterator* NewCompactionIterator(const ReadOptions& options, uint64_t file_number,
-                                  uint64_t file_size, Table** tableptr = nullptr);
+                                  uint64_t file_size, Disk compaction_disk, Table** tableptr = nullptr);
 
   // If a seek to internal key "k" in specified file finds an entry,
   // call (*handle_result)(arg, found_key, found_value).
@@ -59,7 +59,7 @@ class TableCache {
 
  private:
   Status FindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
-  Status CompactionFindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
+  Status CompactionFindTable(uint64_t file_number, uint64_t file_size, Disk compaction_disk, Cache::Handle**);
 
   Env* const env_;
   const std::string dbname_;
