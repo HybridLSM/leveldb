@@ -653,6 +653,37 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  Status MigrationFile(const std::string& from, const std::string& to) override {
+    int fd_in, fd_out;
+    struct ::stat file_stat;
+    loff_t len, ret;
+
+    fd_in = ::open(from.c_str(), O_RDONLY);
+    if (fd_in < 0) 
+      return PosixError(from, errno);
+
+    if (::stat(from.c_str(), &file_stat) !=  0)
+      return PosixError(from, errno);
+
+    len = file_stat.st_size;
+
+    fd_out = ::open(to.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd_out < 0)
+      return PosixError(from, errno);
+
+    do {
+      ret = ::copy_file_range(fd_in, NULL, fd_out, NULL, len, 0);
+      if (ret == -1)
+        return PosixError(to, errno);
+
+      len -= ret;
+    } while (len > 0 && ret > 0);
+
+    ::close(fd_in);
+    ::close(fd_out);
+    return Status::OK();
+  }
+
   Status LockFile(const std::string& filename, FileLock** lock) override {
     *lock = nullptr;
 

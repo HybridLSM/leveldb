@@ -584,6 +584,10 @@ class WindowsEnv : public Env {
     }
   }
 
+  Status MigrationFile(const std::string& from, const std::string& to) override {
+    return RemoveFile(from, to);
+  }
+
   Status LockFile(const std::string& filename, FileLock** lock) override {
     *lock = nullptr;
     Status result;
