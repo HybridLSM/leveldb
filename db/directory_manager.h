@@ -29,6 +29,7 @@ class DirectoryManager {
         hdd_path_(hdd_path),
         env_(env),
         produce_s2h_(&mutex_),
+        produce_h2s_(&mutex_),
         consume_s2h_(&mutex_),
         consume_h2s_(&mutex_),
         s2h_finished_(&mutex_),
@@ -55,6 +56,7 @@ class DirectoryManager {
     mutex_.Unlock();
   }
 
+  inline
   Disk DetermineFileDisk(int level, FileArea area=FileArea::fNormal) {
     assert(area != FileArea::fUnKnown);
     
@@ -67,9 +69,25 @@ class DirectoryManager {
     return type;
   }
   
+  inline
+  Disk DetermineCompactionDisk(int compaction_level) const {
+    if (compaction_level <= 1)
+      return Disk::SSD;
+    else
+      return Disk::HDD;
+  }
+
   // Compaction in HDD
-  std::string CompactionDefaultFilePath() const {
-    return hdd_path_;
+  std::string GetCompactionFilePath(int compaction_level) const {
+    Disk type = DetermineCompactionDisk(compaction_level);
+    if (type == Disk::SSD)
+      return ssd_path_;
+    else
+      return hdd_path_;
+  }
+
+  Disk GetCompactionDisk(int compaction_level) const {
+    return DetermineCompactionDisk(compaction_level);
   }
 
   std::string GetFileDiskPath(int level, FileArea area) {
@@ -175,10 +193,24 @@ class DirectoryManager {
   }
   
   // File migration from SSD to HDD
-  void FileMigrationSSD2HDD(std::vector<FileMetaData*> hw_input) {
+  void FileMigrationSSD2HDD(std::vector<FileMetaData*>& input) {
     MutexLock l(&mutex_);
-    for (auto it : hw_input)
+    for (auto it : input)
       files_to_migrate_s2h_.push(it->number);
+    consume_s2h_.Signal();
+  }
+
+  // File migration from HDD to SSD
+  void FileMigrationHDD2SSD(std::vector<FileMetaData*>& input) {
+    MutexLock l(&mutex_);
+    for (auto it: input)
+      files_to_migrate_h2s_.push(it->number);
+    consume_h2s_.Signal();
+  }
+
+  void FileMigrationSSD2HDD(uint64_t file_num) {
+    MutexLock l(&mutex_);
+    files_to_migrate_s2h_.push(file_num);
     consume_s2h_.Signal();
   }
 
@@ -189,22 +221,42 @@ class DirectoryManager {
     consume_h2s_.Signal();
   }
 
-  std::string CompactionGetFileDiskPath(uint64_t file_num, Status* status) {
+  std::string CompactionGetFileDiskPath(uint64_t file_num, Disk compaction_disk, Status* status) {
     MutexLock l(&mutex_);
-    bool in_hdd = hdd_file_set_.find(file_num) != hdd_file_set_.end();
-    bool migration_failed = failed_files_status_.find(file_num) != failed_files_status_.end();
-    while (!in_hdd && !migration_failed) {
-      produce_s2h_.Wait(); // wait for migration
-      in_hdd = hdd_file_set_.find(file_num) != hdd_file_set_.end();
-      migration_failed = failed_files_status_.find(file_num) != failed_files_status_.end();
-    }
+    
+    std::string result;
+    if (compaction_disk == Disk::HDD) {
+      bool in_hdd = hdd_file_set_.find(file_num) != hdd_file_set_.end();
+      bool migration_failed = failed_files_status_.find(file_num) != failed_files_status_.end();
+      while (!in_hdd && !migration_failed) {
+        produce_s2h_.Wait(); // wait for migration
+        in_hdd = hdd_file_set_.find(file_num) != hdd_file_set_.end();
+        migration_failed = failed_files_status_.find(file_num) != failed_files_status_.end();
+      }
 
-    assert(in_hdd);
-    if (migration_failed)
-      *status = failed_files_status_[file_num];
-    else
-      *status = Status::OK();
-    return hdd_path_;
+      assert(in_hdd);
+      if (migration_failed)
+        *status = failed_files_status_[file_num];
+      else
+        *status = Status::OK();
+      result = hdd_path_;
+    } else {
+      bool in_ssd = ssd_file_set_.find(file_num) != ssd_file_set_.end();
+      bool migration_failed = failed_files_status_.find(file_num) != failed_files_status_.end();
+      while (!in_ssd && !migration_failed) {
+        produce_h2s_.Wait(); // wait for migration
+        in_ssd = ssd_file_set_.find(file_num) != ssd_file_set_.end();
+        migration_failed = failed_files_status_.find(file_num) != failed_files_status_.end();
+      }
+
+      assert(in_ssd);
+      if (migration_failed)
+        *status = failed_files_status_[file_num];
+      else
+        *status = Status::OK();
+      result = ssd_path_;
+    }
+    return result;
   }
 
   // void RecordDiskFile(uint64_t file_num, Disk type) {
@@ -223,6 +275,7 @@ class DirectoryManager {
   
   port::Mutex mutex_;
   port::CondVar produce_s2h_;
+  port::CondVar produce_h2s_;
   port::CondVar consume_s2h_;
   port::CondVar consume_h2s_;
   port::CondVar s2h_finished_;
@@ -279,8 +332,8 @@ class DirectoryManager {
           } else {
             failed_files_status_[file_num] = status;
           }
-          mutex_.Unlock();
           produce_s2h_.Signal();
+          mutex_.Unlock();
         }
 
         mutex_.Lock();
@@ -335,6 +388,7 @@ class DirectoryManager {
           } else {
             failed_files_status_[file_num] = status;
           }
+          produce_h2s_.Signal();
           mutex_.Unlock();
         }
 

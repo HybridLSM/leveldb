@@ -241,7 +241,7 @@ static Iterator* GetFileIterator(void* arg, const ReadOptions& options,
   }
 }
 
-static Iterator* GetFileIteratorWithFileNum(void* arg, const ReadOptions& options,
+static Iterator* GetSSDFileIteratorWithFileNum(void* arg, const ReadOptions& options,
                                  const Slice& file_value) {
   TableCache* cache = reinterpret_cast<TableCache*>(arg);
   if (file_value.size() != 16) {
@@ -249,7 +249,19 @@ static Iterator* GetFileIteratorWithFileNum(void* arg, const ReadOptions& option
         Status::Corruption("FileReader invoked with unexpected value"));
   } else {
     return NewIteratorWithFileNumber(DecodeFixed64(file_value.data()), 
-                                    cache->NewCompactionIterator(options, DecodeFixed64(file_value.data()), DecodeFixed64(file_value.data() + 8)));
+                                    cache->NewCompactionIterator(options, DecodeFixed64(file_value.data()), DecodeFixed64(file_value.data() + 8), Disk::SSD));
+  }
+}
+
+static Iterator* GetHDDFileIteratorWithFileNum(void* arg, const ReadOptions& options,
+                                 const Slice& file_value) {
+  TableCache* cache = reinterpret_cast<TableCache*>(arg);
+  if (file_value.size() != 16) {
+    return NewErrorIterator(
+        Status::Corruption("FileReader invoked with unexpected value"));
+  } else {
+    return NewIteratorWithFileNumber(DecodeFixed64(file_value.data()), 
+                                    cache->NewCompactionIterator(options, DecodeFixed64(file_value.data()), DecodeFixed64(file_value.data() + 8), Disk::HDD));
   }
 }
 
@@ -2074,6 +2086,8 @@ Iterator* VersionSet::MakeInputIteratorWithFileNumber(Compaction* c) {
   ReadOptions options;
   options.verify_checksums = options_->paranoid_checks;
   options.fill_cache = false;
+  DirectoryManager* dir_manager = table_cache_->GetDirManager();
+  Disk compaction_disk = dir_manager->GetCompactionDisk(c->level());
 
   // Level-0 files have to be merged together.  For other levels,
   // we will make a concatenating iterator per level.
@@ -2090,14 +2104,20 @@ Iterator* VersionSet::MakeInputIteratorWithFileNumber(Compaction* c) {
         const std::vector<FileMetaData*>& files = c->inputs_[which];
         for (size_t i = 0; i < files.size(); i++) {
           list[num++] = NewIteratorWithFileNumber(files[i]->number, 
-                                                  table_cache_->NewCompactionIterator(options, files[i]->number, files[i]->file_size));
+                                                  table_cache_->NewCompactionIterator(options, files[i]->number, files[i]->file_size, compaction_disk));
           
         }
       } else {
         // Create concatenating iterator for the files from this level
-        list[num++] = NewTwoLevelIterator(
-                        new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]),
-                        &GetFileIteratorWithFileNum, table_cache_, options);
+        if (compaction_disk == Disk::SSD) {
+          list[num++] = NewTwoLevelIterator(
+                          new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]),
+                          &GetSSDFileIteratorWithFileNum, table_cache_, options);
+        } else {
+          list[num++] = NewTwoLevelIterator(
+                          new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]),
+                          &GetHDDFileIteratorWithFileNum, table_cache_, options);
+        }
       }
     }
   }
@@ -2107,7 +2127,7 @@ Iterator* VersionSet::MakeInputIteratorWithFileNumber(Compaction* c) {
     const std::vector<FileMetaData*>& files = c->hw_input_;
     for (size_t i = 0; i < files.size(); i++) {
       list[num++] = NewIteratorWithFileNumber(files[i]->number,
-                                              table_cache_->NewCompactionIterator(options, files[i]->number, files[i]->file_size));
+                                              table_cache_->NewCompactionIterator(options, files[i]->number, files[i]->file_size, compaction_disk));
     }
   }
   assert(num <= space);
@@ -2400,10 +2420,35 @@ void VersionSet::SetupOtherInputsWithSeparation(Compaction* c) {
 
   // Migrate
   DirectoryManager *dir_manager = table_cache_->GetDirManager();
-  if (c->inputs_[0].size() != 0 && c->level() == 0)  // Migrate level 0 files
-    dir_manager->FileMigrationSSD2HDD(c->inputs_[0]);
-  if (c->hw_input_.size() != 0)
-    dir_manager->FileMigrationSSD2HDD(c->hw_input_); 
+  Disk compaction_disk = dir_manager->GetCompactionDisk(c->level());
+  for (int which =0; which < 2; ++which) {
+    int level = c->level() + which;
+    Disk cur_disk = dir_manager->DetermineFileDisk(level, FileArea::fNormal);
+    if (c->inputs_[level].size() != 0 && cur_disk != compaction_disk) {
+      if (compaction_disk == Disk::SSD)
+        dir_manager->FileMigrationHDD2SSD(c->inputs_[level]);
+      else
+        dir_manager->FileMigrationSSD2HDD(c->inputs_[level]);
+
+
+      Log(options_->info_log, "Batch migrate@%d from %s to %s: %lld tables",
+          level, DiskToString(cur_disk).c_str(), DiskToString(compaction_disk).c_str(), (unsigned long long)c->inputs_[level].size());
+
+    }
+  }
+
+  if (!c->hw_input_.empty()) {
+    Disk cur_disk = dir_manager->DetermineFileDisk(config::kNumLevels, FileArea::fHot);
+    if (cur_disk != compaction_disk) {
+      if (compaction_disk == Disk::SSD)
+        dir_manager->FileMigrationHDD2SSD(c->hw_input_);
+      else
+        dir_manager->FileMigrationSSD2HDD(c->hw_input_);
+    
+      Log(options_->info_log, "Batch migrate@hw_level from %s to %s: %lld tables",
+          DiskToString(cur_disk).c_str(), DiskToString(compaction_disk).c_str(), (unsigned long long)c->hw_input_.size());
+    }
+  }
 
   // Update the place where we will do the next compaction for this level.
   // We update this immediately instead of waiting for the VersionEdit
