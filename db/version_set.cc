@@ -1165,6 +1165,51 @@ void Version::GetOverlappingInputs(int level, const InternalKey* begin,
   }
 }
 
+// Store in "*inputs" all files in "level" that overlap [begin,end]
+void Version::GetOlderOverlappingInputs(int level, const InternalKey* begin,
+                                        const InternalKey* end, const uint32_t filenum,
+                                        std::vector<FileMetaData*>* inputs) {
+  assert(level >= 0);
+  assert(level < config::kNumLevels);
+  inputs->clear();
+  Slice user_begin, user_end;
+  if (begin != nullptr) {
+    user_begin = begin->user_key();
+  }
+  if (end != nullptr) {
+    user_end = end->user_key();
+  }
+  const Comparator* user_cmp = vset_->icmp_.user_comparator();
+  for (size_t i = 0; i < files_[level].size();) {
+    FileMetaData* f = files_[level][i++];
+    const Slice file_start = f->smallest.user_key();
+    const Slice file_limit = f->largest.user_key();
+    if (f->number > filenum){
+      // "f" is newer than first file; skip it
+    } else if (begin != nullptr && user_cmp->Compare(file_limit, user_begin) < 0) {
+      // "f" is completely before specified range; skip it
+    } else if (end != nullptr && user_cmp->Compare(file_start, user_end) > 0) {
+      // "f" is completely after specified range; skip it
+    } else {
+      inputs->push_back(f);
+      if (level == 0) {
+        // Level-0 files may overlap each other.  So check if the newly
+        // added file has expanded the range.  If so, restart search.
+        if (begin != nullptr && user_cmp->Compare(file_start, user_begin) < 0) {
+          user_begin = file_start;
+          inputs->clear();
+          i = 0;
+        } else if (end != nullptr &&
+                   user_cmp->Compare(file_limit, user_end) > 0) {
+          user_end = file_limit;
+          inputs->clear();
+          i = 0;
+        }
+      }
+    }
+  }
+}
+
 void Version::GetOverlappingHWInputs(FileArea area, const InternalKey* begin,
                                      const InternalKey* end,
                                      std::vector<FileMetaData*>* inputs) {
@@ -2235,7 +2280,7 @@ Compaction* VersionSet::PickCompactionWithSeparation() {
     // Note that the next call will discard the file we placed in
     // c->inputs_[0] earlier and replace it with an overlapping set
     // which will include the picked file.
-    current_->GetOverlappingInputs(0, &smallest, &largest, &c->inputs_[0]);
+    current_->GetOlderOverlappingInputs(0, &smallest, &largest, c->inputs_[0][0]->number, &c->inputs_[0]);
     assert(!c->inputs_[0].empty());
   }
 

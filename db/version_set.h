@@ -126,6 +126,13 @@ class Version {
       const InternalKey* end,    // nullptr means after all keys
       std::vector<FileMetaData*>* inputs);
 
+  void GetOlderOverlappingInputs(
+      int level,
+      const InternalKey* begin,  // nullptr means before all keys
+      const InternalKey* end,    // nullptr means after all keys
+      const uint32_t filenum,    // input filenum
+      std::vector<FileMetaData*>* inputs);
+
   void GetOverlappingHWInputs(FileArea area, const InternalKey* begin,
                               const InternalKey* end,
                               std::vector<FileMetaData*>* inputs);
