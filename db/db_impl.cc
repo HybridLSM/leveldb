@@ -779,9 +779,9 @@ void DBImpl::CompactMemTable() {
     has_imm_.store(false, std::memory_order_release);
     if (hot_cold_separation_) {
       RemoveObsoleteFilesWithSeparation();
-      // if (versions_->current()->CheckScoreCompact(score_table_, options_.score_compaction_threhold)) {
-      //   MaybeScheduleCompaction();
-      // }
+      if (versions_->current()->CheckScoreCompact(score_table_, options_.score_compaction_threhold)) {
+        MaybeScheduleCompaction();
+      }
     } else {
       RemoveObsoleteFiles();
     }
@@ -970,7 +970,11 @@ void DBImpl::BackgroundCompaction() {
     }
   } else {
     CompactionState* compact = new CompactionState(c);
-    status = hot_cold_separation_ ? DoCompactionWorkWithSpearation(compact) : DoCompactionWork(compact);
+    if(options_.hot_cold_separation && compact->compaction->level() > config::kNumLevels) {
+      // TODO : HW Compaction
+    } else {
+     status = hot_cold_separation_ ? DoCompactionWorkWithSpearation(compact) : DoCompactionWork(compact); 
+    }
     if (!status.ok()) {
       RecordBackgroundError(status);
     }
@@ -1502,6 +1506,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 
 Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
   assert(hot_cold_separation_);
+  assert(compact->compaction->level() < config::kNumLevels);
+  assert(compact->compaction->num_hw_input_files() == 0);
   assert(hot_table_ != nullptr);
   assert(key_upd_lru_ != nullptr);
   assert(score_table_ != nullptr);
@@ -1510,11 +1516,10 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
   const uint64_t start_micros = env_->NowMicros();
   int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
 
-  Log(options_.info_log, "Compacting %d@%d + %d@%d + %dfiles",
+  Log(options_.info_log, "Compacting %d@%d + %d@%d files",
       compact->compaction->num_input_files(0), compact->compaction->level(),
       compact->compaction->num_input_files(1),
-      compact->compaction->level() + 1,
-      compact->compaction->num_hw_input_files());
+      compact->compaction->level() + 1);
 
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
@@ -1591,7 +1596,7 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
         drop = true;  // (A)
       } else if (ikey.type == kTypeDeletion &&
                  ikey.sequence <= compact->smallest_snapshot &&
-                 compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
+                 compact->compaction->IsBaseLevelForKeyWithSeparation(ikey.user_key)) {
         // For this user key:
         // (1) there is no data in higher levels
         // (2) data in lower levels will have larger sequence numbers
@@ -1607,7 +1612,7 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
         // and can be throw 
         drop = true;
       } else {
-        // For the user key will rise, check for conflicts
+        // For the user key will float up, check for conflicts
         Version* cur_version = versions_->current();
         LookupKey lkey(current_user_key, versions_->LastSequence());
         Version::GetStats tmp_stat;
@@ -1750,27 +1755,35 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
   delete input;
   input = nullptr;
 
-  CompactionStats stats;
+  CompactionStats stats, hot_stats, warm_stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
   for (int which = 0; which < 2; which++) {
     for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
       stats.bytes_read += compact->compaction->input(which, i)->file_size;
     }
   }
-  for (int i = 0; i < compact->compaction->num_hw_input_files(); i++) {
-    stats.bytes_read += compact->compaction->hw_input(i)->file_size;
+  if(compact->compaction->level() == 0) {
+    for (int i = 0; i < compact->compaction->num_hw_input_files(); i++) {
+      hot_stats.bytes_read += compact->compaction->hw_input(i)->file_size;
+    }
+  } else if(compact->compaction->level() == 1) {
+    for (int i = 0; i < compact->compaction->num_hw_input_files(); i++) {
+      warm_stats.bytes_read += compact->compaction->hw_input(i)->file_size;
+    }
   }
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     stats.bytes_written += compact->outputs[i].file_size;
   }
   for (size_t i = 0; i < compact->hot_outputs.size(); i++) {
-    stats.bytes_written += compact->hot_outputs[i].file_size;
+    hot_stats.bytes_written += compact->hot_outputs[i].file_size;
   }
   for (size_t i = 0; i < compact->warm_outputs.size(); i++) {
-    stats.bytes_written += compact->warm_outputs[i].file_size;
+    warm_stats.bytes_written += compact->warm_outputs[i].file_size;
   }
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
+  hot_stats_.Add(hot_stats);
+  warm_stats_.Add(warm_stats);
 
   if (status.ok()) {
     VersionSet::LevelSummaryStorage tmp;
@@ -1781,6 +1794,194 @@ Status DBImpl::DoCompactionWorkWithSpearation(CompactionState* compact) {
         score_table_->RemoveSstScore(compact->compaction->input(which, i)->number);
       }
     }
+  }
+  if (!status.ok()) {
+    RecordBackgroundError(status);
+  }
+  VersionSet::LevelSummaryStorage tmp;
+  Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
+  return status;
+}
+
+Status DBImpl::DoHWCompactionWork(CompactionState* compact) {
+  assert(hot_cold_separation_);
+  assert(compact->compaction->level() == config::kNumLevels + (int)FileArea::fHot || 
+         compact->compaction->level() == config::kNumLevels + (int)FileArea::fWarm);
+  assert(compact->compaction->num_input_files(0) == 0 &&
+         compact->compaction->num_input_files(1) == 0);
+  assert(hot_table_ != nullptr);
+  assert(key_upd_lru_ != nullptr);
+  assert(score_table_ != nullptr);
+  assert(dir_manager_ != nullptr);
+
+  bool is_hot = compact->compaction->level() == config::kNumLevels + (int)FileArea::fHot;
+
+  const uint64_t start_micros = env_->NowMicros();
+  int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
+
+  Log(options_.info_log, "Compacting %d %s files",
+      compact->compaction->num_hw_input_files(),
+      is_hot ? "hot" : "warm");
+  
+  assert(compact->builder == nullptr);
+  assert(compact->outfile == nullptr);
+  assert(compact->hot_builder == nullptr);
+  assert(compact->hot_outfile == nullptr);
+  assert(compact->warm_builder == nullptr);
+  assert(compact->warm_outfile == nullptr);
+  if (snapshots_.empty()) {
+    compact->smallest_snapshot = versions_->LastSequence();
+  } else {
+    compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
+  }
+
+  mutex_.Unlock();
+  Iterator* input = versions_->MakeInputIteratorWithFileNumber(compact->compaction);
+  input->SeekToFirst();
+  Status status;
+  ParsedInternalKey ikey;
+  std::string current_user_key;
+  bool has_current_user_key;
+  SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+  while(input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
+    // Prioritize immutable compaction work
+    if (has_imm_.load(std::memory_order_relaxed)) {
+      const uint64_t imm_start = env_->NowMicros();
+      mutex_.Lock();
+      if (imm_ != nullptr) {
+        CompactMemTable();
+        // Wake up MakeRoomForWrite() if necessary.
+        background_work_finished_signal_.SignalAll();
+      }
+      mutex_.Unlock();
+      imm_micros += (env_->NowMicros() - imm_start);
+    }
+
+    Slice key_and_filenum = input->key();
+    Slice key = Slice(key_and_filenum.data(), key_and_filenum.size() - 8);
+    uint64_t cur_file_num = DecodeFixed64(key_and_filenum.data() + key.size());
+
+    // Handle key/value, add to state, etc
+    bool drop = false;
+    uint64_t newest_file_num;
+    if (!ParseInternalKey(key, &ikey)) {
+      // Do not hide error keys
+      current_user_key.clear();
+      has_current_user_key = false;
+      last_sequence_for_key = kMaxSequenceNumber;
+    } else {
+      if (!has_current_user_key ||
+          user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
+              0) {
+        // First occurrence of this user key
+        current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
+        has_current_user_key = true;
+        last_sequence_for_key = kMaxSequenceNumber;
+      }
+
+      if(last_sequence_for_key <= compact->smallest_snapshot) {
+        // Hidden by an newer entry for same user key
+        drop = true;  // (A)
+      } else if(ikey.type == kTypeDeletion &&
+                ikey.sequence <= compact->smallest_snapshot &&
+                compact->compaction->IsBaseLevelForKeyWithSeparation(ikey.user_key)) {
+        drop = true;
+      } else if (key_upd_lru_->FindSst(ikey.user_key, &newest_file_num) &&
+                 newest_file_num != cur_file_num) {
+        drop = true;
+      } 
+    }
+
+    if(!drop) {
+      // Select target builder
+      TableBuilder* builder;
+      CompactionState::Output* output;
+      FileArea area = FileArea::fUnKnown;
+      if(is_hot) {
+        builder = compact->hot_builder;
+        output = compact->current_hot_output();
+        area = FileArea::fHot;
+      } else {
+        builder = compact->warm_builder;
+        output = compact->current_warm_output();
+        area = FileArea::fWarm;
+      }
+
+      // Open output file if necessary
+      if(builder == nullptr) {
+        if(area == FileArea::fHot){
+          status = OpenCompactionHWOutputFile(compact, area);
+          output = compact->current_hot_output();
+          builder = compact->hot_builder;
+        } else {
+          status = OpenCompactionHWOutputFile(compact, area);
+          output = compact->current_warm_output();
+          builder = compact->warm_builder;
+        }
+        if(!status.ok()) {
+          break;
+        }
+      }
+      if (builder->NumEntries() == 0) {
+        output->smallest.DecodeFrom(key);
+      }
+      output->largest.DecodeFrom(key);
+      builder->Add(key, input->value());
+
+      // Close output file if it is big enough
+      if(builder->FileSize() >=
+         compact->compaction->MaxOutputFileSize()) {
+        status = FinishCompactionHWOutputFile(compact, input, area);
+        if(!status.ok()) {
+          break;
+        }
+      }
+
+      // Update Key Update Table
+      key_upd_lru_->CompareAndUpdateSst(ikey.user_key, cur_file_num, output->number);
+    }
+
+    input->Next(); 
+  }
+
+  if(status.ok() && shutting_down_.load(std::memory_order_acquire)) {
+    status = Status::IOError("Deleting DB during compaction");
+  }
+  if(status.ok() && compact->hot_builder != nullptr) {
+    status = FinishCompactionHWOutputFile(compact, input, FileArea::fHot);
+  }
+  if(status.ok() && compact->warm_builder != nullptr) {
+    status = FinishCompactionHWOutputFile(compact, input, FileArea::fWarm);
+  }
+  if (status.ok()) {
+    status = input->status();
+  }
+  delete input;
+  input = nullptr;
+
+  CompactionStats stats;
+  stats.micros = env_->NowMicros() - start_micros - imm_micros;
+  for(int i = 0; i < compact->compaction->num_hw_input_files(); i++) {
+    stats.bytes_read += compact->compaction->hw_input(i)->file_size;
+  }
+  if(is_hot) {
+    for (size_t i = 0; i < compact->hot_outputs.size(); i++) {
+      stats.bytes_written += compact->hot_outputs[i].file_size;
+    }
+    mutex_.Lock();
+    hot_stats_.Add(stats);
+  } else {
+    for (size_t i = 0; i < compact->warm_outputs.size(); i++) {
+      stats.bytes_written += compact->warm_outputs[i].file_size;
+    }
+    mutex_.Lock();
+    warm_stats_.Add(stats);
+  }
+
+  if (status.ok()) {
+    VersionSet::LevelSummaryStorage tmp;
+    Log(options_.info_log, "Before compacted: %s", versions_->LevelSummary(&tmp));
+    status = InstallCompactionResultsWithSeparation(compact);
   }
   if (!status.ok()) {
     RecordBackgroundError(status);
@@ -2206,6 +2407,24 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
                       stats_[level].micros / 1e6,
                       stats_[level].bytes_read / 1048576.0,
                       stats_[level].bytes_written / 1048576.0);
+        value->append(buf);
+      }
+    }
+    if(options_.hot_cold_separation) {
+      if(hot_stats_.micros > 0 || versions_->NumHotFiles() > 0) {
+        std::snprintf(buf, sizeof(buf), "hot %8d %8.0f %9.0f %8.0f %9.0f\n",
+                      versions_->NumHotFiles(), versions_->NumHotLevelBytes() / 1048576.0,
+                      hot_stats_.micros / 1e6,
+                      hot_stats_.bytes_read / 1048576.0,
+                      hot_stats_.bytes_written / 1048576.0);
+        value->append(buf);
+      }
+      if(warm_stats_.micros > 0 || versions_->NumWarmFiles() > 0) {
+        std::snprintf(buf, sizeof(buf), "warm %8d %8.0f %9.0f %8.0f %9.0f\n",
+                      versions_->NumWarmFiles(), versions_->NumWarmLevelBytes() / 1048576.0,
+                      warm_stats_.micros / 1e6,
+                      warm_stats_.bytes_read / 1048576.0,
+                      warm_stats_.bytes_written / 1048576.0);
         value->append(buf);
       }
     }
