@@ -1388,8 +1388,18 @@ class VersionSet::Builder {
     // Update compaction pointers
     for (size_t i = 0; i < edit->compact_pointers_.size(); i++) {
       const int level = edit->compact_pointers_[i].first;
-      vset_->compact_pointer_[level] =
+      if(level >= config::kNumLevels) {
+        assert(vset_->options_->hot_cold_separation && 
+               (level == config::kNumLevels + (int)FileArea::fHot || level == config::kNumLevels + (int)FileArea::fWarm));
+        if(level == config::kNumLevels + (int)FileArea::fHot) {
+          vset_->hot_compact_pointer_ = edit->compact_pointers_[i].second.Encode().ToString();
+        } else {
+          vset_->warm_compact_pointer_ = edit->compact_pointers_[i].second.Encode().ToString();
+        }
+      } else{
+        vset_->compact_pointer_[level] =
           edit->compact_pointers_[i].second.Encode().ToString();
+      }
     }
 
     // Delete files
@@ -2375,7 +2385,7 @@ Compaction* VersionSet::PickCompactionWithSeparation() {
   // We prefer compactions triggered by too much data in a level over
   // the compactions triggered by seeks.
   const bool size_compaction = (current_->compaction_score_ >= 1);
-  const bool hw_compaction = (current_->hw_file_to_compact_area_ != FileArea::fUnKnown);
+  const bool hw_compaction = (current_->hw_file_to_compact_area_ != FileArea::fUnKnown) && !size_compaction;
   const bool score_compaction = (current_->file_to_compact_ != nullptr);
   if (size_compaction) {
     level = current_->compaction_level_;

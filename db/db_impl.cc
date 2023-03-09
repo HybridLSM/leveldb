@@ -944,34 +944,34 @@ void DBImpl::BackgroundCompaction() {
   Status status;
   if (c == nullptr) {
     // Nothing to do
-  } else if (!is_manual && c->IsTrivialMove()) {
-    // Move file to next level
-    assert(c->num_input_files(0) == 1);
-    FileMetaData* f = c->input(0, 0);
-    if (hot_cold_separation_) {
-      //env_->RenameFile(TableFileName(ssd_path_, f->number), TableFileName(hdd_path_, f->number));
-      status = dir_manager_->FileTrivialMove(c->level(), f->number);
-    } 
-    if (status.ok()) {
-      c->edit()->RemoveFile(c->level(), f->number);
-      c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
-                        f->largest);
-      status = versions_->LogAndApply(c->edit(), &mutex_);
-      if (!status.ok()) {
-        RecordBackgroundError(status);
-      }
-      VersionSet::LevelSummaryStorage tmp;
-      Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
-          static_cast<unsigned long long>(f->number), c->level() + 1,
-          static_cast<unsigned long long>(f->file_size),
-          status.ToString().c_str(), versions_->LevelSummary(&tmp));
-    } else {
-      RecordBackgroundError(status);
-    }
+  // } else if (!is_manual && c->IsTrivialMove()) {
+  //   // Move file to next level
+  //   assert(c->num_input_files(0) == 1);
+  //   FileMetaData* f = c->input(0, 0);
+  //   if (hot_cold_separation_) {
+  //     //env_->RenameFile(TableFileName(ssd_path_, f->number), TableFileName(hdd_path_, f->number));
+  //     status = dir_manager_->FileTrivialMove(c->level(), f->number);
+  //   } 
+  //   if (status.ok()) {
+  //     c->edit()->RemoveFile(c->level(), f->number);
+  //     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
+  //                       f->largest);
+  //     status = versions_->LogAndApply(c->edit(), &mutex_);
+  //     if (!status.ok()) {
+  //       RecordBackgroundError(status);
+  //     }
+  //     VersionSet::LevelSummaryStorage tmp;
+  //     Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
+  //         static_cast<unsigned long long>(f->number), c->level() + 1,
+  //         static_cast<unsigned long long>(f->file_size),
+  //         status.ToString().c_str(), versions_->LevelSummary(&tmp));
+  //   } else {
+  //     RecordBackgroundError(status);
+  //   }
   } else {
     CompactionState* compact = new CompactionState(c);
     if(options_.hot_cold_separation && compact->compaction->level() > config::kNumLevels) {
-      // TODO : HW Compaction
+      status = DoHWCompactionWork(compact);
     } else {
      status = hot_cold_separation_ ? DoCompactionWorkWithSpearation(compact) : DoCompactionWork(compact); 
     }
