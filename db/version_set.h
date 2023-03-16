@@ -172,6 +172,7 @@ class Version {
         file_to_compact_level_(-1),
         hw_file_to_compact_area_(FileArea::fUnKnown),
         num_be_preempted(0),
+        num_small_file(0),
         compaction_score_(-1),
         compaction_level_(-1) {}
 
@@ -220,6 +221,7 @@ class Version {
   // Next file to compact based on hot/warm compaction trigger
   FileArea hw_file_to_compact_area_;
   int num_be_preempted;
+  int num_small_file;
 
   // Level that should be compacted next and its compaction score.
   // Score < 1 means compaction is not strictly needed.  These fields
@@ -397,8 +399,6 @@ class VersionSet {
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.
   std::string compact_pointer_[config::kNumLevels];
-  std::string hot_compact_pointer_;
-  std::string warm_compact_pointer_;
 };
 
 // A Compaction encapsulates information about a compaction.

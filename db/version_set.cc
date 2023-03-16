@@ -324,6 +324,10 @@ static bool NewestFirst(FileMetaData* a, FileMetaData* b) {
   return a->number > b->number;
 }
 
+static bool OldestFirst(FileMetaData* a, FileMetaData* b) {
+  return a->number < b->number;
+}
+
 void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
                                  bool (*func)(void*, int, FileMetaData*)) {
   const Comparator* ucmp = vset_->icmp_.user_comparator();
@@ -1388,18 +1392,8 @@ class VersionSet::Builder {
     // Update compaction pointers
     for (size_t i = 0; i < edit->compact_pointers_.size(); i++) {
       const int level = edit->compact_pointers_[i].first;
-      if(level >= config::kNumLevels) {
-        assert(vset_->options_->hot_cold_separation && 
-               (level == config::kNumLevels + (int)FileArea::fHot || level == config::kNumLevels + (int)FileArea::fWarm));
-        if(level == config::kNumLevels + (int)FileArea::fHot) {
-          vset_->hot_compact_pointer_ = edit->compact_pointers_[i].second.Encode().ToString();
-        } else {
-          vset_->warm_compact_pointer_ = edit->compact_pointers_[i].second.Encode().ToString();
-        }
-      } else{
-        vset_->compact_pointer_[level] =
+      vset_->compact_pointer_[level] =
           edit->compact_pointers_[i].second.Encode().ToString();
-      }
     }
 
     // Delete files
@@ -2005,7 +1999,7 @@ void VersionSet::CheckHWCompaction(Version* v) {
   // hot level
   int small_files = 0;
   v->num_be_preempted = current_->num_be_preempted;
-  if(v->hot_files_.size() > 0) {
+  if(v->hot_files_.size() > 5) {
     for(const FileMetaData* f : v->hot_files_) {
       if(f->file_size <= options_->max_file_size / 2) {
         small_files++;
@@ -2013,11 +2007,12 @@ void VersionSet::CheckHWCompaction(Version* v) {
     }
     if(small_files >= v->hot_files_.size() / 2) {
       v->hw_file_to_compact_area_ = FileArea::fHot;
+      v->num_small_file = small_files;
       Log(options_->info_log, "%d small hot files need to be compacted.", small_files);
       return;
     }
   }
-  if(v->warm_files_.size() > 0) {
+  if(v->warm_files_.size() > 5) {
     small_files = 0;
     for(const FileMetaData* f : v->warm_files_) {
       if(f->file_size <= options_->max_file_size / 2) {
@@ -2026,6 +2021,7 @@ void VersionSet::CheckHWCompaction(Version* v) {
     }
     if(small_files >= v->warm_files_.size() / 2) {
       v->hw_file_to_compact_area_ = FileArea::fWarm;
+      v->num_small_file = small_files;
       Log(options_->info_log, "%d small warms files need to be compacted.", small_files);
       return;
     }
@@ -2425,34 +2421,23 @@ Compaction* VersionSet::PickCompactionWithSeparation() {
     level = config::kNumLevels + (int)current_->hw_file_to_compact_area_;
     c = new Compaction(options_, level);
 
-    // Pick the first file
-    std::string pointer = current_->hw_file_to_compact_area_ == FileArea::fHot ? hot_compact_pointer_ : warm_compact_pointer_;
-    std::vector<FileMetaData*>& files = current_->hw_file_to_compact_area_ == FileArea::fHot ? current_->hot_files_ : current_->warm_files_;
-    for(size_t i = 0; i < files.size(); i++) {
-      FileMetaData* f = files[i];
-      if(pointer.empty() || icmp_.Compare(f->largest.Encode(), pointer) > 0) {
-        c->hw_input_.push_back(f);
+    // Pick the enough
+    std::vector<FileMetaData*> files = current_->hw_file_to_compact_area_ == FileArea::fHot ? current_->hot_files_ : current_->warm_files_;
+    std::sort(files.begin(), files.end(), OldestFirst);
+    int num_init_input = 0;
+    while(c->hw_input_.size() < current_->num_small_file / 2 && num_init_input < files.size()) {
+      c->hw_input_.clear();
+      num_init_input++;
+      for(int i = 0; i < num_init_input; i++) {
+        c->hw_input_.push_back(files[i]);
       }
-      break;
-    }    
-    if(c->hw_input_.empty()) {
-      c->hw_input_.push_back(files[0]);
+
+      InternalKey smallest, largest;
+      GetRange(c->hw_input_, &smallest, &largest);
+      current_->GetOverlappingHWInputs(current_->hw_file_to_compact_area_, &smallest, &largest, &c->hw_input_);
+      AddBoundaryInputs(icmp_, files, &c->hw_input_);
     }
-
-    // Get overlapping input
-    InternalKey smallest, largest;
-    GetRange(c->hw_input_, &smallest, &largest);
-    current_->GetOverlappingHWInputs(current_->hw_file_to_compact_area_, &smallest, &largest, &c->hw_input_);
-    AddBoundaryInputs(icmp_, files, &c->hw_input_);
     assert(!c->hw_input_.empty());
-
-    // Set pointer
-    GetRange(c->hw_input_, &smallest, &largest);
-    if(current_->hw_file_to_compact_area_ == FileArea::fHot)
-      hot_compact_pointer_ = largest.Encode().ToString();
-    else 
-      warm_compact_pointer_ = largest.Encode().ToString();
-    c->edit_.SetCompactPointer(level, largest);
   } 
   else if (score_compaction) {
     level = current_->file_to_compact_level_;
