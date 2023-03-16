@@ -973,7 +973,7 @@ void DBImpl::BackgroundCompaction() {
     if(options_.hot_cold_separation && compact->compaction->level() > config::kNumLevels) {
       status = DoHWCompactionWork(compact);
     } else {
-     status = hot_cold_separation_ ? DoCompactionWorkWithSpearation(compact) : DoCompactionWork(compact); 
+      status = hot_cold_separation_ ? DoCompactionWorkWithSpearation(compact) : DoCompactionWork(compact); 
     }
     if (!status.ok()) {
       RecordBackgroundError(status);

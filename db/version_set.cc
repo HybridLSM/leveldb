@@ -2004,26 +2004,29 @@ void VersionSet::CheckHWCompaction(Version* v) {
   // If there are two many small file in hot level and warm level
   // hot level
   int small_files = 0;
+  v->num_be_preempted = current_->num_be_preempted;
   if(v->hot_files_.size() > 0) {
     for(const FileMetaData* f : v->hot_files_) {
-      if(f->file_size <= options_->max_file_size) {
+      if(f->file_size <= options_->max_file_size / 2) {
         small_files++;
       }
     }
-    if(small_files >= v->hot_files_.size()) {
+    if(small_files >= v->hot_files_.size() / 2) {
       v->hw_file_to_compact_area_ = FileArea::fHot;
+      Log(options_->info_log, "%d small hot files need to be compacted.", small_files);
       return;
     }
   }
   if(v->warm_files_.size() > 0) {
     small_files = 0;
     for(const FileMetaData* f : v->warm_files_) {
-      if(f->file_size <= options_->max_file_size) {
+      if(f->file_size <= options_->max_file_size / 2) {
         small_files++;
       }
     }
-    if(small_files >= v->warm_files_.size()) {
+    if(small_files >= v->warm_files_.size() / 2) {
       v->hw_file_to_compact_area_ = FileArea::fWarm;
+      Log(options_->info_log, "%d small warms files need to be compacted.", small_files);
       return;
     }
   }
@@ -2384,9 +2387,20 @@ Compaction* VersionSet::PickCompactionWithSeparation() {
 
   // We prefer compactions triggered by too much data in a level over
   // the compactions triggered by seeks.
-  const bool size_compaction = (current_->compaction_score_ >= 1);
-  const bool hw_compaction = (current_->hw_file_to_compact_area_ != FileArea::fUnKnown) && !size_compaction;
-  const bool score_compaction = (current_->file_to_compact_ != nullptr);
+  bool size_compaction = (current_->compaction_score_ >= 1);
+  bool hw_compaction = current_->hw_file_to_compact_area_ != FileArea::fUnKnown;
+  bool score_compaction = (current_->file_to_compact_ != nullptr);
+  if(size_compaction && hw_compaction) {
+    if(current_->num_be_preempted >= 5) {
+      size_compaction = false;
+      current_->num_be_preempted = 0;
+      Log(options_->info_log, "HW Compaction preempred(%d times).", current_->num_be_preempted);
+    } else {
+      hw_compaction = false;
+      current_->num_be_preempted++;
+      Log(options_->info_log, "HW Compaction has been preempred(%d times).", current_->num_be_preempted);
+    }
+  }
   if (size_compaction) {
     level = current_->compaction_level_;
     assert(level >= 0);

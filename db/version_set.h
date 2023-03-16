@@ -171,6 +171,7 @@ class Version {
         file_to_compact_(nullptr),
         file_to_compact_level_(-1),
         hw_file_to_compact_area_(FileArea::fUnKnown),
+        num_be_preempted(0),
         compaction_score_(-1),
         compaction_level_(-1) {}
 
@@ -218,6 +219,7 @@ class Version {
 
   // Next file to compact based on hot/warm compaction trigger
   FileArea hw_file_to_compact_area_;
+  int num_be_preempted;
 
   // Level that should be compacted next and its compaction score.
   // Score < 1 means compaction is not strictly needed.  These fields
