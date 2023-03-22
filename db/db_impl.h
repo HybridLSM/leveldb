@@ -157,6 +157,8 @@ class DBImpl : public DB {
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status DoCompactionWorkWithSpearation(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status DoHWCompactionWork(CompactionState* compact)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status OpenCompactionOutputFile(CompactionState* compact);
   Status OpenCompactionHWOutputFile(CompactionState* compact, FileArea area);
@@ -227,6 +229,8 @@ class DBImpl : public DB {
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
+  CompactionStats hot_stats_;
+  CompactionStats warm_stats_;
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

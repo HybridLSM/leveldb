@@ -71,7 +71,7 @@ class DirectoryManager {
   
   inline
   Disk DetermineCompactionDisk(int compaction_level) const {
-    if (compaction_level <= 1)
+    if (compaction_level <= 1 || compaction_level > config::kNumLevels)
       return Disk::SSD;
     else
       return Disk::HDD;

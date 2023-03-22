@@ -18,6 +18,7 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <atomic>
 #include <unordered_map>
 
 #include "db/dbformat.h"
@@ -169,6 +170,9 @@ class Version {
         refs_(0),
         file_to_compact_(nullptr),
         file_to_compact_level_(-1),
+        hw_file_to_compact_area_(FileArea::fUnKnown),
+        num_be_preempted(0),
+        num_small_file(0),
         compaction_score_(-1),
         compaction_level_(-1) {}
 
@@ -213,6 +217,11 @@ class Version {
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;
   int file_to_compact_level_;
+
+  // Next file to compact based on hot/warm compaction trigger
+  FileArea hw_file_to_compact_area_;
+  int num_be_preempted;
+  int num_small_file;
 
   // Level that should be compacted next and its compaction score.
   // Score < 1 means compaction is not strictly needed.  These fields
@@ -261,9 +270,13 @@ class VersionSet {
 
   // Return the number of Table files at the specified level.
   int NumLevelFiles(int level) const;
+  int NumHotFiles() const;
+  int NumWarmFiles() const;
 
   // Return the combined file size of all files at the specified level.
   int64_t NumLevelBytes(int level) const;
+  int64_t NumHotLevelBytes() const;
+  int64_t NumWarmLevelBytes() const;
 
   // Return the last sequence number.
   uint64_t LastSequence() const { return last_sequence_; }
@@ -314,7 +327,7 @@ class VersionSet {
   // Returns true iff some level needs a compaction.
   bool NeedsCompaction() const {
     Version* v = current_;
-    return (v->compaction_score_ >= 1) || (v->file_to_compact_ != nullptr);
+    return (v->compaction_score_ >= 1) || (v->file_to_compact_ != nullptr) || (v->hw_file_to_compact_area_ != FileArea::fUnKnown);
   }
 
   // Add all files listed in any live version to *live.
@@ -341,6 +354,8 @@ class VersionSet {
   bool ReuseManifest(const std::string& dscname, const std::string& dscbase);
 
   void Finalize(Version* v);
+
+  void CheckHWCompaction(Version* v);
 
   void GetRange(const std::vector<FileMetaData*>& inputs, InternalKey* smallest,
                 InternalKey* largest);
@@ -425,6 +440,8 @@ class Compaction {
   // the compaction is producing data in "level+1" for which no data exists
   // in levels greater than "level+1".
   bool IsBaseLevelForKey(const Slice& user_key);
+
+  bool IsBaseLevelForKeyWithSeparation(const Slice& user_key);
 
   // Returns true iff we should stop building the current output
   // before processing "internal_key".

@@ -782,8 +782,8 @@ class Benchmark {
     options.compression =
         FLAGS_compression ? kSnappyCompression : kNoCompression;
     options.hot_cold_separation = true;
-    options.ssd_path = "/data/leveldb-test/ssd";
-    options.hdd_path = "/data/leveldb-test/hdd";
+    options.ssd_path = "/mnt/nvme0n1/czt_test/db";
+    options.hdd_path = "/tmp/czt_test/db";
     Status s = DB::Open(options, FLAGS_db, &db_);
     if (!s.ok()) {
       std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
@@ -1096,7 +1096,7 @@ int main(int argc, char** argv) {
   // Choose a location for the test database if none given with --db=<path>
   if (FLAGS_db == nullptr) {
     leveldb::g_env->GetTestDirectory(&default_db_path);
-    default_db_path = "/data/leveldb-test/ssd";
+    default_db_path = "/mnt/nvme0n1/czt_test/db";
     FLAGS_db = default_db_path.c_str();
   }
 

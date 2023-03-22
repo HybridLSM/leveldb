@@ -134,7 +134,9 @@ class InternalKeyComparatorWithFileNum : public Comparator {
                              const Slice& limit) const override;
   void FindShortSuccessor(std::string* key) const override;
 
-  const Comparator* user_comparator() const { return internalkey_comparator_; }
+  const Comparator* internalkey_comparator() const { return internalkey_comparator_; }
+
+  const Comparator* user_comparator() const { return internalkey_comparator_->user_comparator(); }
 };
 
 // Filter policy wrapper that converts from internal keys to user keys
